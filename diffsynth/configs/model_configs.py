@@ -295,6 +295,23 @@ wan_series = [
         "extra_kwargs": {'has_image_input': False, 'patch_size': [1, 2, 2], 'in_dim': 48, 'dim': 3072, 'ffn_dim': 14336, 'freq_dim': 256, 'text_dim': 4096, 'out_dim': 48, 'num_heads': 24, 'num_layers': 30, 'eps': 1e-06, 'seperated_timestep': True, 'require_clip_embedding': False, 'require_vae_embedding': False, 'fuse_vae_embedding_in_latents': True}
     },
     {
+        # Example: ModelConfig(model_id="alibaba-pai/Wan2.2-Fun-5B-Control", origin_file_pattern="diffusion_pytorch_model.safetensors")
+        # Finetuned from Wan2.2-TI2V-5B with an added FunControl/FunReference conditioning path
+        # (control_video + reference_image, see WanVideoUnit_FunControl/WanVideoUnit_FunReference)
+        # -- same dense 5B architecture and key naming as the plain TI2V-5B entry above (no
+        # state_dict_converter needed), but in_dim=148 (48 z + 4 mask + 48 y/image latent + 48
+        # control latent) instead of 48, and a ref_conv sized for 48-channel (Wan2.2 VAE) latents
+        # instead of the 16-channel default every other has_ref_conv=True entry in this file uses.
+        # require_vae_embedding/fuse_vae_embedding_in_latents intentionally left at WanModel's
+        # defaults (True/False) -- unlike plain TI2V-5B, this variant conditions via the explicit
+        # y-channel-concat path, not the "fuse" shortcut, matching the PAI/Wan2.2-Fun-A14B-Control
+        # entry below.
+        "model_hash": "8cf5720f1d99f2d3d9f4d059c99f7e25",
+        "model_name": "wan_video_dit",
+        "model_class": "diffsynth.models.wan_video_dit.WanModel",
+        "extra_kwargs": {'has_image_input': False, 'patch_size': [1, 2, 2], 'in_dim': 148, 'dim': 3072, 'ffn_dim': 14336, 'freq_dim': 256, 'text_dim': 4096, 'out_dim': 48, 'num_heads': 24, 'num_layers': 30, 'eps': 1e-06, 'require_clip_embedding': False, 'has_ref_conv': True, 'in_dim_ref_conv': 48}
+    },
+    {
         # Example: ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="Wan2.2_VAE.pth")
         "model_hash": "e1de6c02cdac79f8b739f4d3698cd216",
         "model_name": "wan_video_vae",

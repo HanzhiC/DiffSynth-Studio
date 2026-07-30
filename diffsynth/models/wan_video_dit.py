@@ -354,6 +354,7 @@ class WanModel(torch.nn.Module):
         has_image_input: bool,
         has_image_pos_emb: bool = False,
         has_ref_conv: bool = False,
+        in_dim_ref_conv: int = 16,
         add_control_adapter: bool = False,
         in_dim_control_adapter: int = 24,
         seperated_timestep: bool = False,
@@ -409,7 +410,7 @@ class WanModel(torch.nn.Module):
         if has_image_input:
             self.img_emb = MLP(1280, dim, has_pos_emb=has_image_pos_emb)  # clip_feature_dim = 1280
         if has_ref_conv:
-            self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
+            self.ref_conv = nn.Conv2d(in_dim_ref_conv, dim, kernel_size=(2, 2), stride=(2, 2))
         self.has_image_pos_emb = has_image_pos_emb
         self.has_ref_conv = has_ref_conv
         if add_control_adapter:
