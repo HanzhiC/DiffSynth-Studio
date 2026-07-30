@@ -208,6 +208,83 @@ class GateModule(nn.Module):
     def forward(self, x, gate, residual):
         return x + gate * residual
 
+class ConditionVideoAdapter(nn.Module):
+    """Pools a variable-length condition video's VAE-latent patches into a small, fixed number of
+    tokens via a Perceiver/Flamingo-resampler pattern -- lets a condition video of any length
+    (e.g. a downsampled full robot episode) feed the DiT at a fixed, small token count, decoupled
+    from both its own length and the target video's length. See this same reimplementation pattern
+    already used elsewhere for a different modality in the downstream repo that vendors this
+    project (`src/models/vla/blocks.py::PerceiverResampler`) -- kept as a separate from-scratch
+    copy here rather than an import, since DiffSynth-Studio must stay dependency-free of any repo
+    that vendors it (the dependency direction only ever goes the other way).
+
+    Not part of any pretrained Wan checkpoint's state dict -- attached post-hoc to an
+    already-loaded `WanModel` via `WanModel.add_condition_video_adapter`, not resolved through
+    `configs/model_configs.py`'s state-dict-hash registry, since there is no pretrained checkpoint
+    whose weights this module could be loaded from.
+
+    Cites arXiv:2512.02015 (Edit-by-Track, "Generative Video Motion Editing with 3D Point Tracks")
+    for the general principle this design follows -- condition on a full video via attention
+    rather than a frame-aligned channel-concat (which is what this same project's own
+    `WanVideoUnit_FunControl`/`control_video` mechanism requires, and why it can't take a
+    variable-length condition). Edit-by-Track's own mechanism concatenates the condition video's
+    own patchified token sequence directly into the DiT's self-attention instead of pooling it --
+    richer signal, but a meaningfully larger token count/compute cost; this module deliberately
+    takes the cheaper, fixed-size pooled-token route instead.
+    """
+
+    def __init__(self, in_channels, dim, num_tokens=64, num_heads=8, patch_size=(1, 2, 2)):
+        super().__init__()
+        self.patch_embedding = nn.Conv3d(in_channels, dim, kernel_size=patch_size, stride=patch_size)
+        self.num_tokens = num_tokens
+        self.query_tokens = nn.Parameter(torch.randn(1, num_tokens, dim) * 0.02)
+        self.norm_tokens = nn.LayerNorm(dim)
+        self.norm_context = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads=num_heads, batch_first=True)
+
+    def forward(self, latents):
+        """latents: [B, C, F, H, W] (variable F/H/W) -> [B, num_tokens, dim]"""
+        x = self.patch_embedding(latents)
+        x = rearrange(x, "b d f h w -> b (f h w) d")
+        queries = self.norm_tokens(self.query_tokens.expand(x.shape[0], -1, -1))
+        context = self.norm_context(x)
+        out, _ = self.attn(query=queries, key=context, value=context, need_weights=False)
+        return out
+
+
+class ConditionVideoCrossAttention(nn.Module):
+    """A new, separate cross-attention branch for injecting `ConditionVideoAdapter`'s pooled
+    tokens into a `DiTBlock` -- deliberately NOT the same code path as `CrossAttention`'s existing
+    `has_image_input` CLIP-feature fusion above, which shares Wan's own pretrained output
+    projection `self.o` and was trained end-to-end by the original authors, so it isn't zero-init
+    and isn't a template reusable for a module we're adding fresh post-hoc.
+
+    Zero-init via a learnable scalar gate (Flamingo-style "gated cross-attention"), not via
+    zero-initializing `self.o` itself: `self.o` keeps normal initialization so it has something
+    real to learn from step one once `gate` moves away from 0, while `gate=0` at construction time
+    makes this branch's contribution to `DiTBlock.forward` exactly zero -- i.e. a freshly-attached
+    instance is an exact identity, and training starts from the pretrained checkpoint's unmodified
+    behavior (the actual ControlNet-style guarantee this design depends on)."""
+
+    def __init__(self, dim, num_heads, eps=1e-6):
+        super().__init__()
+        self.norm_q = RMSNorm(dim, eps=eps)
+        self.norm_k = RMSNorm(dim, eps=eps)
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.o = nn.Linear(dim, dim)
+        self.gate = nn.Parameter(torch.zeros(1))
+        self.attn = AttentionModule(num_heads)
+
+    def forward(self, x, condition_tokens):
+        q = self.norm_q(self.q(x))
+        k = self.norm_k(self.k(condition_tokens))
+        v = self.v(condition_tokens)
+        out = self.attn(q, k, v)
+        return self.gate * self.o(out)
+
+
 class DiTBlock(nn.Module):
     def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
         super().__init__()
@@ -225,8 +302,11 @@ class DiTBlock(nn.Module):
             approximate='tanh'), nn.Linear(ffn_dim, dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
+        # Set by WanModel.add_condition_video_adapter (post-hoc, not a constructor arg) -- see
+        # ConditionVideoCrossAttention's docstring.
+        self.cond_cross_attn = None
 
-    def forward(self, x, context, t_mod, freqs):
+    def forward(self, x, context, t_mod, freqs, condition_video_tokens=None):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -240,6 +320,8 @@ class DiTBlock(nn.Module):
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
         x = x + self.cross_attn(self.norm3(x), context)
+        if condition_video_tokens is not None and self.cond_cross_attn is not None:
+            x = x + self.cond_cross_attn(self.norm3(x), condition_video_tokens)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
@@ -418,6 +500,11 @@ class WanModel(torch.nn.Module):
         else:
             self.control_adapter = None
 
+        # Set by add_condition_video_adapter (post-hoc opt-in, not a constructor arg -- see
+        # ConditionVideoAdapter's docstring for why this isn't wired through model_configs.py).
+        self.has_condition_video_input = False
+        self.condition_video_adapter = None
+
         self.prepare_wantodance(in_dim, dim, num_heads, has_image_pos_emb, out_dim, patch_size, eps,
                                 wantodance_enable_music_inject, wantodance_music_inject_layers, wantodance_enable_refimage, wantodance_enable_refface,
                                 wantodance_enable_global, wantodance_enable_dynamicfps, wantodance_enable_unimodel)
@@ -504,9 +591,36 @@ class WanModel(torch.nn.Module):
     def unpatchify(self, x: torch.Tensor, grid_size: torch.Tensor):
         return rearrange(
             x, 'b (f h w) (x y z c) -> b c (f x) (h y) (w z)',
-            f=grid_size[0], h=grid_size[1], w=grid_size[2], 
+            f=grid_size[0], h=grid_size[1], w=grid_size[2],
             x=self.patch_size[0], y=self.patch_size[1], z=self.patch_size[2]
         )
+
+    def add_condition_video_adapter(self, in_channels=48, num_tokens=64, num_heads=8):
+        """Post-hoc opt-in (see ConditionVideoAdapter/ConditionVideoCrossAttention's docstrings for
+        the full rationale): attaches a fresh ConditionVideoAdapter pooler to this model plus a new,
+        separately gated cross-attention branch to every DiTBlock. Called by the training wrapper
+        (see ego-moma's src/models/vla/video_gen.py) after loading pretrained weights via
+        from_pretrained -- not part of any pretrained checkpoint's state dict, so not resolved
+        through configs/model_configs.py's hash-based registry.
+
+        `in_channels=48` matches the Wan2.2 VAE's latent channel count (WanVideoVAE38) used by both
+        wan2.2_ti2v_5b and wan2.2_fun_5b_control -- the only backbones this has been used with so
+        far; override if pairing with a different VAE.
+        """
+        # Match the already-loaded model's device/dtype (typically bfloat16, set at from_pretrained
+        # load time, not by a later blanket `.to()` -- a freshly constructed nn.Module defaults to
+        # float32/CPU regardless of what device/dtype the rest of the model was cast to, so a caller
+        # that adds this adapter after from_pretrained but before its own `.to(device)` would
+        # otherwise hit a dtype mismatch the first time this module actually runs).
+        ref_param = self.patch_embedding.weight
+        self.condition_video_adapter = ConditionVideoAdapter(
+            in_channels=in_channels, dim=self.dim, num_tokens=num_tokens, num_heads=num_heads,
+        ).to(device=ref_param.device, dtype=ref_param.dtype)
+        for block in self.blocks:
+            block.cond_cross_attn = ConditionVideoCrossAttention(self.dim, num_heads=num_heads).to(
+                device=ref_param.device, dtype=ref_param.dtype
+            )
+        self.has_condition_video_input = True
 
     def forward(self,
                 x: torch.Tensor,
@@ -514,6 +628,7 @@ class WanModel(torch.nn.Module):
                 context: torch.Tensor,
                 clip_feature: Optional[torch.Tensor] = None,
                 y: Optional[torch.Tensor] = None,
+                condition_video_tokens: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
                 **kwargs,
@@ -522,14 +637,14 @@ class WanModel(torch.nn.Module):
             sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
-        
+
         if self.has_image_input:
             x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
             clip_embdding = self.img_emb(clip_feature)
             context = torch.cat([clip_embdding, context], dim=1)
-        
+
         x, (f, h, w) = self.patchify(x)
-        
+
         freqs = torch.cat([
             self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
             self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
@@ -542,10 +657,10 @@ class WanModel(torch.nn.Module):
                     block,
                     use_gradient_checkpointing,
                     use_gradient_checkpointing_offload,
-                    x, context, t_mod, freqs
+                    x, context, t_mod, freqs, condition_video_tokens,
                 )
             else:
-                x = block(x, context, t_mod, freqs)
+                x = block(x, context, t_mod, freqs, condition_video_tokens)
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))

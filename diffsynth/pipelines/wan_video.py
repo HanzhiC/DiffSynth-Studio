@@ -63,6 +63,7 @@ class WanVideoPipeline(BasePipeline):
             WanVideoUnit_ImageEmbedderFused(),
             WanVideoUnit_FunControl(),
             WanVideoUnit_FunReference(),
+            WanVideoUnit_ConditionVideoAdapter(),
             WanVideoUnit_FunCameraControl(),
             WanVideoUnit_SpeedControl(),
             WanVideoUnit_VACE(),
@@ -209,6 +210,9 @@ class WanVideoPipeline(BasePipeline):
         # ControlNet
         control_video: list[Image.Image] = None,
         reference_image: Image.Image = None,
+        # Variable-length condition video (see WanVideoUnit_ConditionVideoAdapter) -- unlike
+        # control_video, this does not need to share num_frames with the target video.
+        condition_video: list[Image.Image] = None,
         # Camera control
         camera_control_direction: Literal["Left", "Right", "Up", "Down", "LeftUp", "LeftDown", "RightUp", "RightDown"] = None,
         camera_control_speed: float = 1/54,
@@ -286,6 +290,7 @@ class WanVideoPipeline(BasePipeline):
             "end_image": end_image,
             "input_video": input_video, "denoising_strength": denoising_strength,
             "control_video": control_video, "reference_image": reference_image,
+            "condition_video": condition_video,
             "camera_control_direction": camera_control_direction, "camera_control_speed": camera_control_speed, "camera_control_origin": camera_control_origin,
             "vace_video": vace_video, "vace_video_mask": vace_video_mask, "vace_reference_image": vace_reference_image, "vace_scale": vace_scale,
             "seed": seed, "rand_device": rand_device,
@@ -487,7 +492,8 @@ class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
             return {}
         pipe.load_models_to_device(self.onload_model_names)
         image = pipe.preprocess_image(input_image.resize((width, height))).to(pipe.device)
-        msk = torch.ones(1, num_frames, height//8, width//8, device=pipe.device)
+        latent_h, latent_w = height // pipe.vae.upsampling_factor, width // pipe.vae.upsampling_factor
+        msk = torch.ones(1, num_frames, latent_h, latent_w, device=pipe.device)
         msk[:, 1:] = 0
         if end_image is not None:
             end_image = pipe.preprocess_image(end_image.resize((width, height))).to(pipe.device)
@@ -497,7 +503,7 @@ class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
             vae_input = torch.concat([image.transpose(0, 1), torch.zeros(3, num_frames-1, height, width).to(image.device)], dim=1)
 
         msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
-        msk = msk.view(1, msk.shape[1] // 4, 4, height//8, width//8)
+        msk = msk.view(1, msk.shape[1] // 4, 4, latent_h, latent_w)
         msk = msk.transpose(1, 2)[0]
         
         y = pipe.vae.encode([vae_input.to(dtype=pipe.torch_dtype, device=pipe.device)], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0]
@@ -547,9 +553,15 @@ class WanVideoUnit_FunControl(PipelineUnit):
         control_latents = pipe.vae.encode(control_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
         control_latents = control_latents.to(dtype=pipe.torch_dtype, device=pipe.device)
         y_dim = pipe.dit.in_dim-control_latents.shape[1]-latents.shape[1]
-        if clip_feature is None or y is None:
+        # clip_feature and y are independent conditioning signals (CLIP-image embedding vs.
+        # VAE-image latent) -- a model with require_clip_embedding=False legitimately has
+        # clip_feature=None while still carrying a real y from WanVideoUnit_ImageEmbedderVAE, so
+        # each needs its own None-fallback rather than a shared "or" that clobbers a valid y with
+        # an all-zero placeholder whenever clip_feature happens to be absent.
+        if clip_feature is None:
             clip_feature = torch.zeros((1, 257, 1280), dtype=pipe.torch_dtype, device=pipe.device)
-            y = torch.zeros((1, y_dim, (num_frames - 1) // 4 + 1, height//8, width//8), dtype=pipe.torch_dtype, device=pipe.device)
+        if y is None:
+            y = torch.zeros((1, y_dim, (num_frames - 1) // 4 + 1, height // pipe.vae.upsampling_factor, width // pipe.vae.upsampling_factor), dtype=pipe.torch_dtype, device=pipe.device)
         else:
             y = y[:, -y_dim:]
         y = torch.concat([control_latents, y], dim=1)
@@ -577,6 +589,43 @@ class WanVideoUnit_FunReference(PipelineUnit):
         clip_feature = pipe.preprocess_image(reference_image)
         clip_feature = pipe.image_encoder.encode_image([clip_feature])
         return {"reference_latents": reference_latents, "clip_feature": clip_feature}
+
+
+
+class WanVideoUnit_ConditionVideoAdapter(PipelineUnit):
+    """Feeds a variable-length condition video (e.g. a downsampled full robot episode, see
+    ego-moma's `src/datasets/robot_video_gen_dataset.py`) into `WanModel`'s optional pooled
+    cross-attention channel (see `wan_video_dit.py::ConditionVideoAdapter`/
+    `WanModel.add_condition_video_adapter`). Unlike `WanVideoUnit_FunControl`'s `control_video`
+    (channel-concatenated with the noised latent, so it must already share the target's frame
+    count), this pools the condition video into a small, fixed token count first, decoupling its
+    length from both the target video's length and from itself run to run.
+
+    A no-op unless BOTH `condition_video` is passed AND the loaded `pipe.dit` actually has the
+    adapter attached (`pipe.dit.condition_video_adapter is not None`) -- this generalizes this
+    codebase's usual "trigger on input presence, not loaded-model presence" `PipelineUnit`
+    convention: the adapter module itself isn't part of any pretrained checkpoint, so its absence
+    is the normal case for every Wan config except the one that explicitly calls
+    `add_condition_video_adapter()`.
+    """
+
+    def __init__(self):
+        super().__init__(
+            input_params=("condition_video", "tiled", "tile_size", "tile_stride"),
+            output_params=("condition_video_tokens",),
+            onload_model_names=("vae",)
+        )
+
+    def process(self, pipe: WanVideoPipeline, condition_video, tiled, tile_size, tile_stride):
+        if condition_video is None or pipe.dit.condition_video_adapter is None:
+            return {}
+        pipe.load_models_to_device(self.onload_model_names)
+        condition_video = pipe.preprocess_video(condition_video)
+        condition_video_latents = pipe.vae.encode(
+            condition_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride
+        ).to(dtype=pipe.torch_dtype, device=pipe.device)
+        condition_video_tokens = pipe.dit.condition_video_adapter(condition_video_latents)
+        return {"condition_video_tokens": condition_video_tokens}
 
 
 
@@ -1284,6 +1333,7 @@ def model_fn_wan_video(
     context: torch.Tensor = None,
     clip_feature: Optional[torch.Tensor] = None,
     y: Optional[torch.Tensor] = None,
+    condition_video_tokens: Optional[torch.Tensor] = None,
     reference_latents = None,
     vace_context = None,
     vace_scale = 1.0,
@@ -1563,10 +1613,10 @@ def model_fn_wan_video(
                     block,
                     use_gradient_checkpointing,
                     use_gradient_checkpointing_offload,
-                    x, context, t_mod, freqs
+                    x, context, t_mod, freqs, condition_video_tokens,
                 )
-              
-            
+
+
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:
                 current_vace_hint = vace_hints[vace.vace_layers_mapping[block_id]]
