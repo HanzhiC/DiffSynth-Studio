@@ -1361,8 +1361,57 @@ def model_fn_wan_video(
     wantodance_fps: float = 30.0,
     music_feature = None,
     skip_9th_layer: bool = False,
+    return_after_block: Optional[int] = None,
+    capture_block: Optional[int] = None,
     **kwargs,
 ):
+    """`return_after_block` (opt-in, default None -- every existing call site omits it, so behavior is
+    byte-identical everywhere else): when set to a positive int k, breaks out of the block loop
+    immediately after processing block index k-1 (i.e. after the k-th block, 1-indexed) and returns the
+    raw, still-patchified hidden-state tensor `x` directly -- skipping every remaining block, `dit.head`,
+    and `unpatchify` entirely. This is a genuine compute skip (not "run everything, read an intermediate
+    value"), for callers that only need an intermediate video-DiT representation (e.g. a downstream
+    action decoder cross-attending to it) and never need the final denoised/unpatchified output or a VAE
+    decode. Mutually exclusive with the sliding-window/LongCat-Video/audio early-return branches below
+    (asserted where relevant) and with `vap`/`vace`/TeaCache paths, none of which this option has been
+    verified against.
+
+    `capture_block` (opt-in, default None, independent of `return_after_block` -- never both set by any
+    real caller): when set to a positive int k, snapshots the (DETACHED) hidden state after the k-th
+    block (1-indexed) into `captured_hidden_state`, then continues the block loop completely normally --
+    unlike `return_after_block`, nothing is skipped; the full video output (head/unpatchify included) is
+    still computed and returned, now as `(video_output, captured_hidden_state)`. For callers that need
+    BOTH the full video-gen output (e.g. to also train the video-gen loss) AND an intermediate
+    representation from the SAME forward pass (e.g. to also train a downstream action decoder), without
+    running the model twice. `.detach()` happens INSIDE this function, at the point of capture, not left
+    to the caller -- this is a hard, construction-level guarantee that a downstream consumer of
+    `captured_hidden_state` (e.g. an action-decoder loss) can never backpropagate into this model's own
+    parameters (LoRA or otherwise): `.detach()` returns a new tensor view and does not mutate `x` itself,
+    so the live (non-detached) `x` continuing through the rest of the loop, and therefore the video
+    branch's own forward/backward, is completely unaffected by whether `capture_block` is set."""
+    if return_after_block is not None:
+        assert sliding_window_size is None and sliding_window_stride is None, (
+            "return_after_block is not supported together with sliding-window tiling."
+        )
+        assert not isinstance(dit, LongCatVideoTransformer3DModel), (
+            "return_after_block is not supported for LongCat-Video."
+        )
+        assert audio_embeds is None, "return_after_block is not supported for wan2.2 s2v."
+        assert 1 <= return_after_block <= len(dit.blocks), (
+            f"return_after_block={return_after_block} out of range -- dit has {len(dit.blocks)} blocks "
+            f"(1-indexed, so valid range is [1, {len(dit.blocks)}])."
+        )
+    if capture_block is not None:
+        assert 1 <= capture_block <= len(dit.blocks), (
+            f"capture_block={capture_block} out of range -- dit has {len(dit.blocks)} blocks "
+            f"(1-indexed, so valid range is [1, {len(dit.blocks)}])."
+        )
+        assert return_after_block is None, (
+            "capture_block and return_after_block are mutually exclusive -- return_after_block "
+            "exits before the full video output capture_block's caller presumably wants would ever "
+            "be computed."
+        )
+
     if sliding_window_size is not None and sliding_window_stride is not None:
         model_kwargs = dict(
             dit=dit,
@@ -1629,14 +1678,26 @@ def model_fn_wan_video(
             # WanToDance
             if hasattr(dit, "wantodance_enable_music_inject") and dit.wantodance_enable_music_inject:
                 x = dit.wantodance_after_transformer_block(block_id, x)
+
+            # Early exit for return_after_block (see this function's docstring) -- return the raw,
+            # still-patchified hidden state immediately after block_id + 1 blocks have run, skipping
+            # every remaining block, dit.head, and unpatchify entirely.
+            if return_after_block is not None and block_id + 1 == return_after_block:
+                return x
+
+            # Capture-without-exiting for capture_block (see this function's docstring) -- snapshot
+            # the DETACHED hidden state, then keep running every remaining block exactly as if
+            # capture_block had never been passed.
+            if capture_block is not None and block_id + 1 == capture_block:
+                captured_hidden_state = x.detach()
         if tea_cache is not None:
             tea_cache.store(x)
-            
+
     if hasattr(dit, "wantodance_enable_unimodel") and dit.wantodance_enable_unimodel and int(wantodance_fps + 0.5) != 30:
         x = dit.head_global(x, t)
     else:
         x = dit.head(x, t)
-    
+
     if use_unified_sequence_parallel:
         if dist.is_initialized() and dist.get_world_size() > 1:
             x = get_sp_group().all_gather(x, dim=1)
@@ -1646,6 +1707,8 @@ def model_fn_wan_video(
         x = x[:, reference_latents.shape[1]:]
         f -= 1
     x = dit.unpatchify(x, (f, h, w))
+    if capture_block is not None:
+        return x, captured_hidden_state
     return x
 
 
