@@ -209,46 +209,98 @@ class GateModule(nn.Module):
         return x + gate * residual
 
 class ConditionVideoAdapter(nn.Module):
-    """Pools a variable-length condition video's VAE-latent patches into a small, fixed number of
-    tokens via a Perceiver/Flamingo-resampler pattern -- lets a condition video of any length
-    (e.g. a downsampled full robot episode) feed the DiT at a fixed, small token count, decoupled
-    from both its own length and the target video's length. See this same reimplementation pattern
-    already used elsewhere for a different modality in the downstream repo that vendors this
-    project (`src/models/vla/blocks.py::PerceiverResampler`) -- kept as a separate from-scratch
-    copy here rather than an import, since DiffSynth-Studio must stay dependency-free of any repo
-    that vendors it (the dependency direction only ever goes the other way).
+    """Pools a variable-length condition video's VAE-latent patches into a fixed-per-frame number
+    of tokens (`tokens_per_frame`, PER latent frame -- NOT collapsed across frames), plus a learned
+    absolute positional embedding per latent-frame index, so the output stays a
+    *temporally-structured* sequence (`F_latent * tokens_per_frame` tokens) rather than one global
+    pooled bag. This is a deliberate revision of an earlier design that pooled ALL patches (across
+    every frame) into one small, globally-fixed token count -- that design decoupled the token count
+    from the condition video's length perfectly, but also destroyed every patch's frame identity
+    before `ConditionVideoCrossAttention` (below) ever saw it, so the DiT's per-target-frame query
+    (which already has its own temporal identity via RoPE) had no way to learn "attend to the
+    condition-video position matching my own progress" -- there was no frame-tagged signal left on
+    the key/value side to correlate against, no matter how the DiT side was trained. Verified
+    empirically too: attention visualizations from the old design only ever showed elevated weight
+    at the condition video's start/end (an artifact of always-included episode-boundary frames
+    being visually distinctive, not real progress-tracking).
+
+    This revision follows the mechanism a related work uses for a similar problem -- Behavior
+    Prompting Policy (arXiv:2606.30457, real-stanford/behavior_prompting), which conditions a
+    manipulation policy on a full human/robot demonstration and reports attention that tracks task
+    progress. Their `TransformerDecoderWithAttn`/`ICRTPromptObsEncoder` (see
+    `transformer_decoder_with_attention.py`/`prompt_obs_encoder.py` in that repo) adds a plain
+    **learned absolute positional embedding, one vector per index along the demo sequence**,
+    directly to the demo/prompt tokens before cross-attention (`prompt_tokens +
+    self.prompt_pos_emb[:, :prompt_tokens.shape[1], :]`) -- no explicit progress estimator, no
+    attention masking trick; progress-aware attention emerges from training once that positional
+    signal is present and the demo tokens keep their per-position identity into the cross-attention.
+    `frame_pos_emb` below is the direct analog for our condition video, added per latent-frame index
+    instead of per demo-timestep.
+
+    Still lets a condition video of any length feed the DiT without a frame-aligned channel-concat
+    (unlike this same project's own `WanVideoUnit_FunControl`/`control_video`) -- see class
+    docstring history/git blame for the fixed-token-count precursor and
+    arXiv:2512.02015 (Edit-by-Track)'s "condition via attention, not channel-concat" principle this
+    still follows, just with per-frame instead of fully-global pooling.
 
     Not part of any pretrained Wan checkpoint's state dict -- attached post-hoc to an
     already-loaded `WanModel` via `WanModel.add_condition_video_adapter`, not resolved through
     `configs/model_configs.py`'s state-dict-hash registry, since there is no pretrained checkpoint
     whose weights this module could be loaded from.
-
-    Cites arXiv:2512.02015 (Edit-by-Track, "Generative Video Motion Editing with 3D Point Tracks")
-    for the general principle this design follows -- condition on a full video via attention
-    rather than a frame-aligned channel-concat (which is what this same project's own
-    `WanVideoUnit_FunControl`/`control_video` mechanism requires, and why it can't take a
-    variable-length condition). Edit-by-Track's own mechanism concatenates the condition video's
-    own patchified token sequence directly into the DiT's self-attention instead of pooling it --
-    richer signal, but a meaningfully larger token count/compute cost; this module deliberately
-    takes the cheaper, fixed-size pooled-token route instead.
     """
 
-    def __init__(self, in_channels, dim, num_tokens=64, num_heads=8, patch_size=(1, 2, 2)):
+    def __init__(self, in_channels, dim, tokens_per_frame=8, num_heads=8, patch_size=(1, 2, 2), max_latent_frames=128):
         super().__init__()
         self.patch_embedding = nn.Conv3d(in_channels, dim, kernel_size=patch_size, stride=patch_size)
-        self.num_tokens = num_tokens
-        self.query_tokens = nn.Parameter(torch.randn(1, num_tokens, dim) * 0.02)
+        self.tokens_per_frame = tokens_per_frame
+        self.max_latent_frames = max_latent_frames
+        # Shared across every latent frame (not one set of weights per frame) -- keeps param count
+        # independent of max_latent_frames, matching the per-frame pooling being the SAME learned
+        # operation applied at each frame, only distinguished afterward by frame_pos_emb below.
+        self.query_tokens = nn.Parameter(torch.randn(1, tokens_per_frame, dim) * 0.02)
+        # The actual per-frame-position signal (see class docstring) -- sliced to the condition
+        # video's real F_latent at forward time, same pattern as BPP's `prompt_pos_emb` slicing.
+        self.frame_pos_emb = nn.Parameter(torch.randn(1, max_latent_frames, 1, dim) * 0.02)
         self.norm_tokens = nn.LayerNorm(dim)
         self.norm_context = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, num_heads=num_heads, batch_first=True)
 
+        # Attention-capture instrumentation (off by default, zero cost/behavior change when unset --
+        # see WanModel.enable_condition_attention_capture). This module runs once per generation
+        # (before the denoising loop, not per-step), so a single snapshot is enough -- no history
+        # list needed, unlike ConditionVideoCrossAttention below.
+        self.capture_attention = False
+        self.last_pooling_attn = None  # [B*F, tokens_per_frame, H*W] once captured -- purely
+        # spatial (within-frame) attention now, since pooling never crosses frame boundaries.
+        self.last_patch_grid = None  # (F, H, W) patch-grid shape, for mapping patches back to frames
+
     def forward(self, latents):
-        """latents: [B, C, F, H, W] (variable F/H/W) -> [B, num_tokens, dim]"""
-        x = self.patch_embedding(latents)
-        x = rearrange(x, "b d f h w -> b (f h w) d")
-        queries = self.norm_tokens(self.query_tokens.expand(x.shape[0], -1, -1))
+        """latents: [B, C, F, H, W] (variable F/H/W) -> [B, F*tokens_per_frame, dim]"""
+        x = self.patch_embedding(latents)  # [B, dim, F, H, W]
+        b, _, f, h, w = x.shape
+        if f > self.max_latent_frames:
+            raise ValueError(
+                f"condition video has {f} VAE-latent frames, exceeding max_latent_frames="
+                f"{self.max_latent_frames} this adapter was constructed with -- pass a larger "
+                f"max_latent_frames to add_condition_video_adapter, or shorten condition_num_frames."
+            )
+        # Fold the frame axis into the batch axis: one batched nn.MultiheadAttention call pools
+        # every frame independently (frames never attend to each other's patches here) instead of
+        # a Python loop over frames.
+        x = rearrange(x, "b d f h w -> (b f) (h w) d")
         context = self.norm_context(x)
-        out, _ = self.attn(query=queries, key=context, value=context, need_weights=False)
+        queries = self.norm_tokens(self.query_tokens.expand(context.shape[0], -1, -1))
+        if self.capture_attention:
+            out, attn_weights = self.attn(
+                query=queries, key=context, value=context, need_weights=True, average_attn_weights=True
+            )
+            self.last_pooling_attn = attn_weights.detach()
+            self.last_patch_grid = (f, h, w)
+        else:
+            out, _ = self.attn(query=queries, key=context, value=context, need_weights=False)
+        out = rearrange(out, "(b f) k d -> b f k d", b=b, f=f)
+        out = out + self.frame_pos_emb[:, :f, :, :]
+        out = rearrange(out, "b f k d -> b (f k) d")
         return out
 
 
@@ -268,6 +320,8 @@ class ConditionVideoCrossAttention(nn.Module):
 
     def __init__(self, dim, num_heads, eps=1e-6):
         super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
         self.q = nn.Linear(dim, dim)
@@ -277,11 +331,44 @@ class ConditionVideoCrossAttention(nn.Module):
         self.gate = nn.Parameter(torch.zeros(1))
         self.attn = AttentionModule(num_heads)
 
+        # Attention-capture instrumentation (off by default -- see
+        # WanModel.enable_condition_attention_capture). Unlike ConditionVideoAdapter above, this
+        # module runs once per DiT block per denoising *step*, so captured weights are appended to
+        # a history list rather than overwritten -- reset_capture() clears it before a fresh
+        # generation call.
+        self.capture_attention = False
+        self.captured_attn_history = []
+
+    def reset_capture(self):
+        self.captured_attn_history = []
+
+    def _attend_with_capture(self, q, k, v):
+        # AttentionModule.forward (flash_attention) never materializes attention weights (that's
+        # the point of a fused kernel) -- fall back to a plain, unfused softmax(qk^T/sqrt(d))v so we
+        # can record the weight matrix. Only taken when capture_attention is set (evaluation/
+        # visualization runs), never during normal train/inference.
+        b, sq, _ = q.shape
+        sk = k.shape[1]
+        head_dim = self.dim // self.num_heads
+        q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads).float()
+        k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads).float()
+        v_ = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads).float()
+        attn_weights = torch.softmax(q @ k.transpose(-1, -2) / (head_dim ** 0.5), dim=-1)  # [b, n, sq, sk]
+        out = attn_weights @ v_  # [b, n, sq, d]
+        out = rearrange(out, "b n s d -> b s (n d)").to(v.dtype)
+        # Mean over heads and query positions -> [b, sk] (sk == num_tokens), one snapshot per
+        # forward call (i.e. per DiT block per denoising step).
+        self.captured_attn_history.append(attn_weights.mean(dim=(1, 2)).detach())
+        return out
+
     def forward(self, x, condition_tokens):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(condition_tokens))
         v = self.v(condition_tokens)
-        out = self.attn(q, k, v)
+        if self.capture_attention:
+            out = self._attend_with_capture(q, k, v)
+        else:
+            out = self.attn(q, k, v)
         return self.gate * self.o(out)
 
 
@@ -595,7 +682,7 @@ class WanModel(torch.nn.Module):
             x=self.patch_size[0], y=self.patch_size[1], z=self.patch_size[2]
         )
 
-    def add_condition_video_adapter(self, in_channels=48, num_tokens=64, num_heads=8):
+    def add_condition_video_adapter(self, in_channels=48, tokens_per_frame=8, num_heads=8, max_latent_frames=128):
         """Post-hoc opt-in (see ConditionVideoAdapter/ConditionVideoCrossAttention's docstrings for
         the full rationale): attaches a fresh ConditionVideoAdapter pooler to this model plus a new,
         separately gated cross-attention branch to every DiTBlock. Called by the training wrapper
@@ -606,6 +693,12 @@ class WanModel(torch.nn.Module):
         `in_channels=48` matches the Wan2.2 VAE's latent channel count (WanVideoVAE38) used by both
         wan2.2_ti2v_5b and wan2.2_fun_5b_control -- the only backbones this has been used with so
         far; override if pairing with a different VAE.
+
+        `max_latent_frames=128` sizes ConditionVideoAdapter's learned per-latent-frame positional
+        embedding table (see its docstring) -- must be >= the condition video's actual VAE-latent
+        frame count at call time (`1 + (condition_num_frames - 1) // 4`), with headroom for any
+        config that raises `condition_num_frames`; 128 latent frames covers up to a 509-raw-frame
+        condition video, comfortably above the 49/61 used by this repo's existing configs.
         """
         # Match the already-loaded model's device/dtype (typically bfloat16, set at from_pretrained
         # load time, not by a later blanket `.to()` -- a freshly constructed nn.Module defaults to
@@ -614,13 +707,60 @@ class WanModel(torch.nn.Module):
         # otherwise hit a dtype mismatch the first time this module actually runs).
         ref_param = self.patch_embedding.weight
         self.condition_video_adapter = ConditionVideoAdapter(
-            in_channels=in_channels, dim=self.dim, num_tokens=num_tokens, num_heads=num_heads,
+            in_channels=in_channels, dim=self.dim, tokens_per_frame=tokens_per_frame, num_heads=num_heads,
+            max_latent_frames=max_latent_frames,
         ).to(device=ref_param.device, dtype=ref_param.dtype)
         for block in self.blocks:
             block.cond_cross_attn = ConditionVideoCrossAttention(self.dim, num_heads=num_heads).to(
                 device=ref_param.device, dtype=ref_param.dtype
             )
         self.has_condition_video_input = True
+
+    def enable_condition_attention_capture(self):
+        """Turn on attention-weight recording for both the condition-video pooling step
+        (`ConditionVideoAdapter`) and every DiT block's injection cross-attention
+        (`ConditionVideoCrossAttention`) -- see `get_condition_attention_capture` for retrieval.
+        Only meaningful after `add_condition_video_adapter`. Adds real overhead (an unfused,
+        weight-materializing attention computation per block per denoising step instead of a fused
+        kernel) -- intended for evaluation/visualization runs, not training."""
+        if self.condition_video_adapter is None:
+            raise RuntimeError("enable_condition_attention_capture called before add_condition_video_adapter.")
+        self.condition_video_adapter.capture_attention = True
+        for block in self.blocks:
+            block.cond_cross_attn.capture_attention = True
+
+    def disable_condition_attention_capture(self):
+        if self.condition_video_adapter is not None:
+            self.condition_video_adapter.capture_attention = False
+        for block in self.blocks:
+            if block.cond_cross_attn is not None:
+                block.cond_cross_attn.capture_attention = False
+
+    def reset_condition_attention_capture(self):
+        """Clear any weights captured by a previous generation call -- call before a fresh one, so
+        `get_condition_attention_capture` doesn't mix history across separate `pipe(...)` calls."""
+        if self.condition_video_adapter is not None:
+            self.condition_video_adapter.last_pooling_attn = None
+            self.condition_video_adapter.last_patch_grid = None
+        for block in self.blocks:
+            if block.cond_cross_attn is not None:
+                block.cond_cross_attn.reset_capture()
+
+    def get_condition_attention_capture(self):
+        """Returns `{"pooling_attn": [B, num_tokens, num_patches] or None, "patch_grid": (F, H, W)
+        or None, "block_attn_history": [block_0_history, ...]}`, where each block's history is a
+        list of `[B, num_tokens]` tensors, one per denoising step captured since the last
+        `reset_condition_attention_capture()` call. Composing these into a per-condition-video-frame
+        attention distribution is downstream-repo-specific (needs to know how raw condition-video
+        frames map to VAE-latent frames) -- see ego-moma's
+        `src/utils/condition_video_attention.py`."""
+        if self.condition_video_adapter is None:
+            return {"pooling_attn": None, "patch_grid": None, "block_attn_history": []}
+        return {
+            "pooling_attn": self.condition_video_adapter.last_pooling_attn,
+            "patch_grid": self.condition_video_adapter.last_patch_grid,
+            "block_attn_history": [block.cond_cross_attn.captured_attn_history for block in self.blocks],
+        }
 
     def forward(self,
                 x: torch.Tensor,
