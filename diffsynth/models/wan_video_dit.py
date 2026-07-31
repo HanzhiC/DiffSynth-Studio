@@ -414,6 +414,126 @@ class DiTBlock(nn.Module):
         return x
 
 
+class ActionSelfAttention(nn.Module):
+    """Self-attention over the action branch's own temporal token sequence -- fused QKV (a single
+    `nn.Linear` projecting to `3*dim`), unlike this file's own `SelfAttention` above. Named to match
+    tau0-WM's released checkpoint 1:1 (`self_attn.qkv`/`.norm_q`/`.norm_k`/`.o`) -- see
+    `ActionDiTBlock`'s docstring for why this must be fused: their own
+    `fused_qkv = fused_qkv and cross_attn_dim == dim` logic only fuses when q/k/v share one
+    dimension, which is true for this self-attention (action_dim -> action_dim) but not for the
+    paired cross-attention below (action_dim query, video dim=3072 key/value)."""
+
+    def __init__(self, dim, num_heads, eps=1e-6):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.norm_q = RMSNorm(dim, eps=eps)
+        self.norm_k = RMSNorm(dim, eps=eps)
+        self.o = nn.Linear(dim, dim)
+        self.attn = AttentionModule(num_heads)
+
+    def forward(self, x, freqs):
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = rope_apply(self.norm_q(q), freqs, self.num_heads)
+        k = rope_apply(self.norm_k(k), freqs, self.num_heads)
+        x = self.attn(q, k, v)
+        return self.o(x)
+
+
+class ActionCrossAttention(nn.Module):
+    """Cross-attention from the action branch's own hidden state into a video `DiTBlock`'s output
+    `x` (dim=3072) -- the actual "read the video-DiT's intermediate features" mechanism tau0-WM's
+    Action-DiT branch uses (see `ActionDiTBlock`'s docstring). q/k/v stay unfused (`q_dim != kv_dim`
+    rules out the fused-QKV path this file's `SelfAttention`/`ActionSelfAttention` use when
+    dimensions match). Named to match the released checkpoint 1:1
+    (`cross_attn.{q,k,v,o,norm_q,norm_k}`)."""
+
+    def __init__(self, q_dim, kv_dim, num_heads, eps=1e-6):
+        super().__init__()
+        self.q_dim = q_dim
+        self.num_heads = num_heads
+        self.q = nn.Linear(q_dim, q_dim)
+        self.k = nn.Linear(kv_dim, q_dim)
+        self.v = nn.Linear(kv_dim, q_dim)
+        self.o = nn.Linear(q_dim, q_dim)
+        self.norm_q = RMSNorm(q_dim, eps=eps)
+        self.norm_k = RMSNorm(q_dim, eps=eps)
+        self.attn = AttentionModule(num_heads)
+
+    def forward(self, x, context):
+        q = self.norm_q(self.q(x))
+        k = self.norm_k(self.k(context))
+        v = self.v(context)
+        x = self.attn(q, k, v)
+        return self.o(x)
+
+
+class ActionDiTBlock(nn.Module):
+    """One block of tau0-WM's pretrained Action-DiT branch (github.com/sii-research/tau-0-wm,
+    Apache 2.0), ported to load directly into this repo's Fun-Control `WanModel` -- see
+    `WanModel.add_action_dit_branch`. Cross-attends into the SAME-INDEXED video `DiTBlock`'s output
+    `x` (threaded through `model_fn_wan_video`'s block loop, mirroring how `condition_video_tokens`
+    already threads through it -- see that function), predicting a robot action jointly with the
+    video branch's own flow-matching denoising, exactly the mechanism their paper describes
+    (verified against their released `model.py` source and real downloaded checkpoint this session,
+    not just the paper).
+
+    Deliberately structured to match tau0-WM's own action-block parameter names AND forward-pass
+    structure exactly -- not just "shape-compatible," but so their checkpoint loads via a plain
+    `load_state_dict(strict=True)` with zero remapping, and so the loaded weights are actually
+    applied the way they were trained. Their own modulation-chunk order (self-attn and ffn AdaLN
+    -gated by a per-block `modulation` parameter; cross-attn output added un-gated) turns out to
+    already match this file's own `DiTBlock.forward` convention exactly -- confirmed by reading
+    their `WanAttentionBlock.forward` directly, not assumed by architectural similarity alone.
+
+    Supports both the simple, non-per-token modulation case (`e` shape `[B, 6, dim]`) AND a
+    per-token/per-frame `has_seq` variant (`e` shape `[B, S_a, 6, dim]`), mirroring `DiTBlock.
+    forward`'s own `has_seq` convention exactly (same broadcasting/chunk/squeeze pattern). The
+    `has_seq` case is what tau0-WM's own `history_action_state` conditioning needs: their
+    `WanModel.forward` prepends clean state-history tokens to the (noised) future action-chunk
+    tokens along the sequence dim, tagged with timestep=0 (known/clean) while the action tokens
+    keep their own noise level -- so the whole concatenated sequence's timestep (and therefore
+    this modulation) is per-token, not one scalar shared by every position. See
+    `model_fn_wan_video`'s action-branch setup block for where `e`'s shape is actually decided
+    (per-token only when `history_action_state` is passed).
+    """
+
+    def __init__(self, dim, video_dim, ffn_dim, num_heads, eps=1e-6):
+        super().__init__()
+        self.dim = dim
+        self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.self_attn = ActionSelfAttention(dim, num_heads, eps)
+        self.norm3 = nn.LayerNorm(dim, eps=eps)
+        self.cross_attn = ActionCrossAttention(dim, video_dim, num_heads, eps)
+        self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'), nn.Linear(ffn_dim, dim))
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+
+    def forward(self, x, e, freqs, context):
+        """x: `[B, S_a, action_dim]`. e: `[B, 6, action_dim]` (global) or `[B, S_a, 6, action_dim]`
+        (per-token, when `history_action_state` conditioning is in play -- see class docstring) --
+        action branch's own timestep modulation, analogous to `DiTBlock.forward`'s `t_mod`, computed
+        from the action branch's own independent noise level -- NOT shared with the video branch's
+        `t_mod`. freqs: 1D RoPE table for the action-token temporal sequence. context: `[B, S_v,
+        video_dim]` -- the paired video `DiTBlock`'s output `x` for this same layer index."""
+        has_seq = len(e.shape) == 4
+        chunk_dim = 2 if has_seq else 1
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.modulation.to(dtype=e.dtype, device=e.device) + e).chunk(6, dim=chunk_dim)
+        if has_seq:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2),
+                shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
+            )
+        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        x = x + gate_msa * self.self_attn(input_x, freqs)
+        x = x + self.cross_attn(self.norm3(x), context)
+        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp * self.ffn(input_x)
+        return x
+
+
 class MLP(torch.nn.Module):
     def __init__(self, in_dim, out_dim, has_pos_emb=False):
         super().__init__()
@@ -592,6 +712,10 @@ class WanModel(torch.nn.Module):
         self.has_condition_video_input = False
         self.condition_video_adapter = None
 
+        # Set by add_action_dit_branch (post-hoc opt-in, same reasoning -- see its docstring).
+        self.has_action_dit_input = False
+        self.action_blocks = None
+
         self.prepare_wantodance(in_dim, dim, num_heads, has_image_pos_emb, out_dim, patch_size, eps,
                                 wantodance_enable_music_inject, wantodance_music_inject_layers, wantodance_enable_refimage, wantodance_enable_refface,
                                 wantodance_enable_global, wantodance_enable_dynamicfps, wantodance_enable_unimodel)
@@ -761,6 +885,63 @@ class WanModel(torch.nn.Module):
             "patch_grid": self.condition_video_adapter.last_patch_grid,
             "block_attn_history": [block.cond_cross_attn.captured_attn_history for block in self.blocks],
         }
+
+    def add_action_dit_branch(
+        self, action_in_dim=20, action_dim=1024, action_ffn_dim=2048, action_num_heads=16,
+        action_max_seq_len=60, eps=1e-6,
+    ):
+        """Post-hoc opt-in (same pattern as `add_condition_video_adapter` above -- not wired through
+        `configs/model_configs.py`'s hash registry, since this isn't part of this model's own
+        pretrained checkpoint): attaches tau0-WM's pretrained Action-DiT branch structure --
+        `action_proj_in` -> `action_blocks` (one `ActionDiTBlock` per video `DiTBlock`, matching
+        `len(self.blocks)`) -> `action_head`, plus the action branch's own independent
+        time-embedding/RoPE machinery -- so their released `action_*`-prefixed checkpoint (see
+        ego-moma's `scripts/convert_tau0wm_action_weights.py`) can be `load_state_dict(strict=True)`
+        'd directly with zero key remapping (see `ActionDiTBlock`'s docstring for why the parameter
+        names are deliberately identical to theirs).
+
+        Defaults (`action_in_dim=20, action_dim=1024, action_ffn_dim=2048, action_num_heads=16,
+        action_max_seq_len=60`) match tau0-WM's own released `config.json` exactly.
+        `action_in_dim=20` happens to equal this repo's own `RobotDataset.ACTION_DIM` -- a shape
+        coincidence, not a semantic one (see ego-moma's plan/docstrings for the full caveat); no
+        resizing is needed to accept this repo's action tensors, but the projection's *learned*
+        weights still need finetuning to mean something for this robot's action space.
+
+        `action_max_seq_len` bounds the action branch's RoPE table, so it must cover the FULL
+        concatenated sequence length when `model_fn_wan_video`'s `history_action_state` is used
+        (state-history token count + the future action-chunk's own token count), not just the
+        action chunk alone -- see that function's action-branch setup block, which asserts this.
+        """
+        ref_param = self.patch_embedding.weight
+        num_layers = len(self.blocks)
+        self.action_proj_in = nn.Linear(action_in_dim, action_dim).to(device=ref_param.device, dtype=ref_param.dtype)
+        self.action_blocks = nn.ModuleList([
+            ActionDiTBlock(action_dim, self.dim, action_ffn_dim, action_num_heads, eps)
+            for _ in range(num_layers)
+        ]).to(device=ref_param.device, dtype=ref_param.dtype)
+        # Same Sequential shapes as WanModel's own time_embedding/time_projection above, just at
+        # action_dim instead of dim -- the action branch's timestep embedding is independent of the
+        # video branch's own `t`/`t_mod` (its own noise level, matching tau0-WM's Eq. 2).
+        self.action_time_embedding = nn.Sequential(
+            nn.Linear(self.freq_dim, action_dim), nn.SiLU(), nn.Linear(action_dim, action_dim),
+        ).to(device=ref_param.device, dtype=ref_param.dtype)
+        self.action_time_projection = nn.Sequential(
+            nn.SiLU(), nn.Linear(action_dim, action_dim * 6),
+        ).to(device=ref_param.device, dtype=ref_param.dtype)
+        # Reuses this file's own `Head` class unchanged: patch_size=(1,1,1) makes
+        # `out_dim * math.prod(patch_size) == out_dim`, i.e. a plain Linear(action_dim, action_in_dim)
+        # with the same AdaLN-modulated-output convention Head already implements -- no separate
+        # class needed, and the resulting state-dict keys (`action_head.{head,modulation}`) already
+        # match the released checkpoint 1:1.
+        self.action_head = Head(action_dim, action_in_dim, (1, 1, 1), eps).to(
+            device=ref_param.device, dtype=ref_param.dtype
+        )
+        assert (action_dim % action_num_heads) == 0 and (action_dim // action_num_heads) % 2 == 0
+        action_head_dim = action_dim // action_num_heads
+        self.action_dim = action_dim
+        self.action_max_seq_len = action_max_seq_len
+        self.action_freqs = precompute_freqs_cis(action_head_dim, end=action_max_seq_len).to(ref_param.device)
+        self.has_action_dit_input = True
 
     def forward(self,
                 x: torch.Tensor,

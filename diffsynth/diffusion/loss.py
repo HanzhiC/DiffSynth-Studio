@@ -63,6 +63,52 @@ def FlowMatchSFTAudioVideoLoss(pipe: BasePipeline, **inputs):
     return loss
 
 
+def FlowMatchSFTLossWithAction(pipe: BasePipeline, **inputs):
+    """`FlowMatchSFTLoss` plus a second flow-matching loss over `inputs["gt_action"]`, for
+    `WanModel.add_action_dit_branch` (see ego-moma's src/models/policy/video_gen.py). Modeled
+    directly on the existing `FlowMatchSFTAudioVideoLoss` above (same file) rather than modifying
+    `FlowMatchSFTLoss` itself: that function already establishes the precedent this needs -- one
+    `pipe.model_fn` call producing a second modality's prediction alongside the video one -- just
+    with actions in place of audio.
+
+    The action target is noised at an **independent** timestep from the video latent's own
+    (matching tau0-WM's own joint objective, which samples the two branches' noise levels
+    independently -- see its Eq. 2) -- reuses the same `pipe.scheduler.add_noise`/`training_target`
+    calls the video branch already uses, since the flow-matching interpolation math is shape
+    -agnostic (no video-specific assumptions), just called on the action tensor instead.
+    """
+    max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
+    min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))
+
+    timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+    timestep = pipe.scheduler.timesteps[timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
+
+    # video (identical to FlowMatchSFTLoss)
+    noise = torch.randn_like(inputs["input_latents"]) * inputs.get("noise_scale", 1.0)
+    inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timestep)
+    training_target = pipe.scheduler.training_target(inputs["input_latents"], noise, timestep)
+
+    # action -- independent timestep from the video's own, per tau0-WM's Eq. 2.
+    action_timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+    action_timestep = pipe.scheduler.timesteps[action_timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
+    gt_action = inputs.pop("gt_action")
+    action_noise = torch.randn_like(gt_action)
+    inputs["action_states"] = pipe.scheduler.add_noise(gt_action, action_noise, action_timestep)
+    inputs["action_timestep"] = action_timestep
+    action_training_target = pipe.scheduler.training_target(gt_action, action_noise, action_timestep)
+
+    models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+    noise_pred, action_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
+
+    loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+    loss = loss * pipe.scheduler.training_weight(timestep)
+
+    action_loss = torch.nn.functional.mse_loss(action_pred.float(), action_training_target.float())
+    action_loss = action_loss * pipe.scheduler.training_weight(action_timestep)
+
+    return loss, action_loss
+
+
 def DirectDistillLoss(pipe: BasePipeline, **inputs):
     pipe.scheduler.set_timesteps(inputs["num_inference_steps"])
     pipe.scheduler.training = True
