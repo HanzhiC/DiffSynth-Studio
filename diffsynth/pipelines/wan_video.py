@@ -267,19 +267,6 @@ class WanVideoPipeline(BasePipeline):
         wantodance_keyframes: list[Image.Image] = None,
         wantodance_keyframes_mask: list[int] = None,
         framewise_decoding: bool = False,
-        # Action-DiT branch (see WanModel.add_action_dit_branch / ActionDiTBlock,
-        # ego-moma's src/models/policy/video_gen.py::VideoGenModel.generate_action) -- genuine
-        # multi-step action generation, riding alongside the video branch's own denoising loop
-        # (both share this call's video `x` at every step, per tau0-WM's `return_video=True`
-        # case; see model_fn_wan_video's action-branch setup for the `return_video=False`
-        # KV-cache-reuse optimization this repo does NOT implement). `action_states`: caller-
-        # supplied initial NOISE, `[1, S_a, action_in_dim]` (no NoiseInitializer unit for this,
-        # unlike the video latent's own `noise` -- there's no natural default shape/count to infer
-        # it from). `history_action_state`: optional real state-history conditioning, unchanged
-        # across every step (never noised/stepped). `None` (default) for either is a complete
-        # no-op, unchanged from this method's pre-existing behavior.
-        action_states: torch.Tensor = None,
-        history_action_state: torch.Tensor = None,
         # progress_bar
         progress_bar_cmd=tqdm,
         output_type: Literal["quantized", "floatpoint"] = "quantized",
@@ -320,7 +307,6 @@ class WanVideoPipeline(BasePipeline):
             "wantodance_music_path": wantodance_music_path, "wantodance_reference_image": wantodance_reference_image, "wantodance_fps": wantodance_fps,
             "wantodance_keyframes": wantodance_keyframes, "wantodance_keyframes_mask": wantodance_keyframes_mask,
             "framewise_decoding": framewise_decoding,
-            "action_states": action_states, "history_action_state": history_action_state,
         }
         for unit in self.units:
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
@@ -337,31 +323,10 @@ class WanVideoPipeline(BasePipeline):
                 
             # Timestep
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
-            if inputs_shared.get("action_states") is not None:
-                # Action branch shares this exact per-step timestep with the video branch (both
-                # denoise together every step here, unlike model_fn_wan_video's own independent-
-                # timestep training-loss convention -- see ActionDiTBlock/FlowMatchSFTLossWithAction
-                # docstrings for that separate case).
-                inputs_shared["action_timestep"] = timestep
-
+            
             # Inference
-            model_output_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
-            # model_fn_wan_video returns a (video, action) tuple exactly when action_states is
-            # not None (see its own docstring/return) -- unpack here rather than at every call
-            # site below.
-            if inputs_shared.get("action_states") is not None:
-                noise_pred_posi, action_pred_posi = model_output_posi
-            else:
-                noise_pred_posi = model_output_posi
+            noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
             if cfg_scale != 1.0:
-                assert inputs_shared.get("action_states") is None, (
-                    "Action-DiT generation (action_states passed) doesn't support cfg_scale != "
-                    "1.0 -- the action branch has no positive/negative-prompt notion of its own "
-                    "(only the video branch's text conditioning does); running the paired "
-                    "negative-prompt model_fn call would produce a second, meaningless action "
-                    "prediction with no defined way to combine it. Use cfg_scale=1.0 for action "
-                    "generation."
-                )
                 if cfg_merge:
                     noise_pred_posi, noise_pred_nega = noise_pred_posi.chunk(2, dim=0)
                 else:
@@ -372,13 +337,6 @@ class WanVideoPipeline(BasePipeline):
 
             # Scheduler
             inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
-            if inputs_shared.get("action_states") is not None:
-                # Same scheduler, same per-step timestep as the video branch (set above) -- no
-                # PipelineUnit involved for action_states/action_timestep, they flow straight from
-                # this dict into model_fn_wan_video every step.
-                inputs_shared["action_states"] = self.scheduler.step(
-                    action_pred_posi, self.scheduler.timesteps[progress_id], inputs_shared["action_states"]
-                )
             if "first_frame_latents" in inputs_shared:
                 inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
         
@@ -403,14 +361,6 @@ class WanVideoPipeline(BasePipeline):
         elif output_type == "floatpoint":
             pass
         self.load_models_to_device([])
-        if inputs_shared.get("action_states") is not None:
-            # Mirrors FlowMatchSFTLossWithAction's existing tuple-return precedent for a second
-            # modality -- every other call site never passes action_states, so this branch is
-            # never reached from existing code, preserving today's single-tensor return exactly.
-            # The returned action_states is the fully denoised (x0-space) prediction, still in
-            # whatever order/scale convention the caller supplied its initial noise in (ego-moma's
-            # VideoGenModel.generate_action reorders/descales it back afterward).
-            return video, inputs_shared["action_states"]
         return video
 
 
@@ -1384,9 +1334,6 @@ def model_fn_wan_video(
     clip_feature: Optional[torch.Tensor] = None,
     y: Optional[torch.Tensor] = None,
     condition_video_tokens: Optional[torch.Tensor] = None,
-    action_states: Optional[torch.Tensor] = None,
-    action_timestep: Optional[torch.Tensor] = None,
-    history_action_state: Optional[torch.Tensor] = None,
     reference_latents = None,
     vace_context = None,
     vace_scale = 1.0,
@@ -1495,56 +1442,6 @@ def model_fn_wan_video(
     if motion_bucket_id is not None and motion_controller is not None:
         t_mod = t_mod + motion_controller(motion_bucket_id).unflatten(1, (6, dit.dim))
     context = dit.text_embedding(context)
-
-    # Action-DiT branch (see WanModel.add_action_dit_branch / ActionDiTBlock) -- own independent
-    # timestep/noise level from the video branch's own `t`/`t_mod` above (matching tau0-WM's Eq. 2,
-    # which jointly optimizes both branches under independently-sampled noise levels). Precomputed
-    # once here (not per-block) since it doesn't depend on the video branch's per-layer `x`, only on
-    # `action_timestep`.
-    action_e0 = action_t = action_freqs = None
-    # Number of state-history tokens prepended below -- 0 (the "no history_action_state" case)
-    # means action_output needs no trimming at the end of this function.
-    action_num_history_tokens = 0
-    if action_states is not None:
-        assert dit.has_action_dit_input, "action_states passed but WanModel.add_action_dit_branch was never called"
-        if history_action_state is not None:
-            # tau0-WM's own history-conditioning mechanism (verified against their released
-            # WanModel.forward, not assumed): prepend clean state-history tokens -- same raw
-            # action_in_dim space as action_states, BEFORE action_proj_in -- to the noised future
-            # action-chunk tokens along the sequence dim. History tokens get timestep=0 (already
-            # known/clean); the action tokens keep their own (shared -- this repo doesn't sample
-            # independently per action-chunk position) noise level, so the concatenated sequence's
-            # timestep -- and therefore its modulation -- is per-token, not one scalar for the
-            # whole sequence. Mirrors this file's own per-token `has_seq` convention used a few
-            # lines above (the `dit.seperated_timestep and fuse_vae_embedding_in_latents` branch)
-            # and by `DiTBlock.forward`/`ActionDiTBlock.forward` -- both assume batch size 1,
-            # matching that branch's own convention and this repo's own video-gen dataloader
-            # (VideoGenDataModule always uses batch_size=1).
-            action_num_history_tokens = history_action_state.shape[1]
-            num_action_tokens = action_states.shape[1]
-            action_states = torch.cat([history_action_state, action_states], dim=1)
-            action_timestep = torch.cat([
-                torch.zeros(action_num_history_tokens, dtype=action_timestep.dtype, device=action_timestep.device),
-                action_timestep.reshape(-1).expand(num_action_tokens),
-            ])
-            action_states = dit.action_proj_in(action_states)
-            action_t = dit.action_time_embedding(
-                sinusoidal_embedding_1d(dit.freq_dim, action_timestep).to(action_states.dtype)
-            ).unsqueeze(0)  # [1, S_total, action_dim] -- see has_seq convention above (batch=1)
-            action_e0 = dit.action_time_projection(action_t).unflatten(2, (6, dit.action_dim))  # [1, S_total, 6, action_dim]
-        else:
-            action_states = dit.action_proj_in(action_states)
-            action_t = dit.action_time_embedding(sinusoidal_embedding_1d(dit.freq_dim, action_timestep).to(action_states.dtype))
-            action_e0 = dit.action_time_projection(action_t).unflatten(1, (6, dit.action_dim))
-        action_seq_len = action_states.shape[1]
-        assert action_seq_len <= dit.action_max_seq_len, (
-            f"Action-DiT branch's total token count ({action_seq_len} = "
-            f"{action_num_history_tokens} history + {action_seq_len - action_num_history_tokens} "
-            f"action) exceeds action_max_seq_len={dit.action_max_seq_len} (bounds the precomputed "
-            f"RoPE table, see WanModel.add_action_dit_branch) -- raise action_max_seq_len or "
-            f"shorten clip_length/history_horizon."
-        )
-        action_freqs = dit.action_freqs[:action_seq_len].unsqueeze(1).to(action_states.device)
 
     x = latents
     # Merged cfg
@@ -1732,14 +1629,6 @@ def model_fn_wan_video(
             # WanToDance
             if hasattr(dit, "wantodance_enable_music_inject") and dit.wantodance_enable_music_inject:
                 x = dit.wantodance_after_transformer_block(block_id, x)
-
-            # Action-DiT branch (see above) -- cross-attends into THIS block's just-updated `x`,
-            # mirroring how condition_video_tokens threads through every block above but reading
-            # (not writing) x, so the video branch is completely unaffected by this branch's
-            # presence -- action_states is None on every other call site in this codebase, a
-            # complete no-op.
-            if action_states is not None:
-                action_states = dit.action_blocks[block_id](action_states, action_e0, action_freqs, x)
         if tea_cache is not None:
             tea_cache.store(x)
             
@@ -1757,20 +1646,6 @@ def model_fn_wan_video(
         x = x[:, reference_latents.shape[1]:]
         f -= 1
     x = dit.unpatchify(x, (f, h, w))
-
-    if action_states is not None:
-        # Mirrors FlowMatchSFTAudioVideoLoss's existing precedent for a model_fn returning a tuple
-        # when a second modality is requested (diffsynth/diffusion/loss.py) -- every other call site
-        # never passes action_states, so this branch and the tuple return are never reached from
-        # existing code, preserving today's single-tensor return exactly.
-        action_output = dit.action_head(action_states, action_t)
-        if action_num_history_tokens > 0:
-            # Drop the prepended history-token positions -- only the future action-chunk
-            # positions have a real noised target to compare against in the loss (see
-            # FlowMatchSFTLossWithAction, which only ever built a target for the pre-concatenation
-            # action_states shape).
-            action_output = action_output[:, action_num_history_tokens:]
-        return x, action_output
     return x
 
 
