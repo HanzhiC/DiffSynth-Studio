@@ -11,25 +11,34 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
     max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
     min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))
 
-    timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+    # One independent timestep per batch element (was hardcoded (1,), i.e. one shared timestep for
+    # the whole batch) -- ego-moma's batch_size>1 training support for VideoGenModel. batch_size=1
+    # (every caller before that work) reduces to the exact previous (1,) shape/behavior.
+    batch_size = inputs["input_latents"].shape[0]
+    timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (batch_size,))
     timestep = pipe.scheduler.timesteps[timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
-    
+
     noise = torch.randn_like(inputs["input_latents"]) * inputs.get("noise_scale", 1.0)
     inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timestep)
     training_target = pipe.scheduler.training_target(inputs["input_latents"], noise, timestep)
-    
+
     if "first_frame_latents" in inputs:
         inputs["latents"][:, :, 0:1] = inputs["first_frame_latents"]
-    
+
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
     noise_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
-    
+
     if "first_frame_latents" in inputs:
         noise_pred = noise_pred[:, :, 1:]
         training_target = training_target[:, :, 1:]
-    
-    loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
-    loss = loss * pipe.scheduler.training_weight(timestep)
+
+    # Per-sample loss (mean over every non-batch dim) so each sample's own randomly-sampled
+    # timestep gets its own training_weight before averaging across the batch -- for batch_size=1
+    # this is exactly equivalent to the previous global .mean() (nothing else to average over).
+    per_sample_loss = torch.nn.functional.mse_loss(
+        noise_pred.float(), training_target.float(), reduction="none"
+    ).flatten(1).mean(dim=1)
+    loss = (per_sample_loss * pipe.scheduler.training_weight(timestep)).mean()
     return loss
 
 
@@ -49,7 +58,12 @@ def FlowMatchSFTLossWithCapturedHiddenState(pipe: BasePipeline, capture_block: i
     max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
     min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))
 
-    timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+    # One independent timestep per batch element -- see FlowMatchSFTLoss's identical comment above.
+    # `timestep` is returned to the caller (VideoGenModel.compute_losses) as the captured hidden
+    # state's own noise level -- now genuinely [B]-shaped, one per sample, which
+    # action_decoder.py::timestep_to_sigma already expects/handles (vectorized per-row lookup).
+    batch_size = inputs["input_latents"].shape[0]
+    timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (batch_size,))
     timestep = pipe.scheduler.timesteps[timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
 
     noise = torch.randn_like(inputs["input_latents"]) * inputs.get("noise_scale", 1.0)
@@ -61,8 +75,11 @@ def FlowMatchSFTLossWithCapturedHiddenState(pipe: BasePipeline, capture_block: i
         **models, **inputs, timestep=timestep, capture_block=capture_block
     )
 
-    loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
-    loss = loss * pipe.scheduler.training_weight(timestep)
+    # Per-sample loss -- see FlowMatchSFTLoss's identical comment above.
+    per_sample_loss = torch.nn.functional.mse_loss(
+        noise_pred.float(), training_target.float(), reduction="none"
+    ).flatten(1).mean(dim=1)
+    loss = (per_sample_loss * pipe.scheduler.training_weight(timestep)).mean()
     return loss, captured_hidden_state, timestep
 
 

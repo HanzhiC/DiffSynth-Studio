@@ -398,6 +398,31 @@ class WanVideoUnit_NoiseInitializer(PipelineUnit):
     
 
 
+def batch_preprocess_video(pipe: "WanVideoPipeline", video, **kwargs):
+    """`video`: either a single clip (a list of `PIL.Image`, the pre-existing convention -- exactly
+    one sample) or a batch of B clips (a list of B such lists, ego-moma's batch_size>1
+    training-support extension), detected by whether the first element is itself a list. Returns a
+    real `[B, C, T, H, W]` tensor either way -- `B=1` for the old convention, byte-identical to
+    calling `pipe.preprocess_video` directly (this is just that call, unchanged, when `video` isn't
+    batched). Every clip in a batch must share `T`/`H`/`W` (guaranteed by ego-moma's
+    `RobotVideoClipDataset`'s fixed per-config `clip_length`/`resize_hw`/`condition_num_frames` --
+    not a constraint this vendored pipeline enforces itself), so a plain `torch.cat` along the batch
+    dim is enough, no padding.
+    """
+    if isinstance(video[0], list):
+        return torch.cat([pipe.preprocess_video(clip, **kwargs) for clip in video], dim=0)
+    return pipe.preprocess_video(video, **kwargs)
+
+
+def batch_preprocess_image_as_video(pipe: "WanVideoPipeline", image, **kwargs):
+    """Same batching convention as `batch_preprocess_video`, for a single-frame conditioning image
+    (e.g. `reference_image`): `image` is either one `PIL.Image` (old convention) or a list of B
+    `PIL.Image` (new batch convention). Returns a `[B, C, 1, H, W]` tensor either way."""
+    if isinstance(image, list):
+        return torch.cat([pipe.preprocess_video([img], **kwargs) for img in image], dim=0)
+    return pipe.preprocess_video([image], **kwargs)
+
+
 class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
@@ -410,7 +435,7 @@ class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
         if input_video is None:
             return {"latents": noise}
         pipe.load_models_to_device(self.onload_model_names)
-        input_video = pipe.preprocess_video(input_video)
+        input_video = batch_preprocess_video(pipe, input_video)
         if framewise_decoding:
             input_latents = pipe.vae.encode_framewise(input_video, device=pipe.device)
         else:
@@ -445,8 +470,16 @@ class WanVideoUnit_PromptEmbedder(PipelineUnit):
         mask = mask.to(pipe.device)
         seq_lens = mask.gt(0).sum(dim=1).long()
         prompt_emb = pipe.text_encoder(ids, mask)
+        # `prompt_emb[i, v:] = 0` -- was `prompt_emb[:, v:] = 0` (every row, not just row i), a
+        # real bug for a genuine batch of B DIFFERENT-length prompts (ego-moma's batch_size>1
+        # training-support extension): the old code zeroed columns [v:] for the WHOLE batch on
+        # every loop iteration, so a shorter-prompt row processed after a longer-prompt row would
+        # get its own valid trailing tokens (between its own v and the other row's v) incorrectly
+        # zeroed out too. Harmless (and unnoticed) at B=1, and also unnoticed by a same-prompt B=2
+        # sanity check (identical seq_lens across rows makes both versions equivalent) -- only
+        # shows up with real, differing-length prompts in the same batch, i.e. real training data.
         for i, v in enumerate(seq_lens):
-            prompt_emb[:, v:] = 0
+            prompt_emb[i, v:] = 0
         return prompt_emb
 
     def process(self, pipe: WanVideoPipeline, prompt, positive) -> dict:
@@ -491,25 +524,44 @@ class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
         if input_image is None or not pipe.dit.require_vae_embedding:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        image = pipe.preprocess_image(input_image.resize((width, height))).to(pipe.device)
-        latent_h, latent_w = height // pipe.vae.upsampling_factor, width // pipe.vae.upsampling_factor
-        msk = torch.ones(1, num_frames, latent_h, latent_w, device=pipe.device)
-        msk[:, 1:] = 0
-        if end_image is not None:
-            end_image = pipe.preprocess_image(end_image.resize((width, height))).to(pipe.device)
-            vae_input = torch.concat([image.transpose(0,1), torch.zeros(3, num_frames-2, height, width).to(image.device), end_image.transpose(0,1)],dim=1)
-            msk[:, -1:] = 1
+        # `input_image`/`end_image`: either a single PIL.Image (old convention, B=1) or a list of B
+        # PIL.Image (ego-moma's batch_size>1 training-support extension) -- same convention as
+        # batch_preprocess_image_as_video, applied here inline since this unit's per-sample
+        # vae_input/msk construction (below) isn't a plain preprocess_video call.
+        images = input_image if isinstance(input_image, list) else [input_image]
+        if isinstance(end_image, list):
+            end_images = end_image
+        elif end_image is not None:
+            end_images = [end_image] * len(images)
         else:
-            vae_input = torch.concat([image.transpose(0, 1), torch.zeros(3, num_frames-1, height, width).to(image.device)], dim=1)
+            end_images = [None] * len(images)
+        latent_h, latent_w = height // pipe.vae.upsampling_factor, width // pipe.vae.upsampling_factor
 
-        msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
-        msk = msk.view(1, msk.shape[1] // 4, 4, latent_h, latent_w)
-        msk = msk.transpose(1, 2)[0]
-        
-        y = pipe.vae.encode([vae_input.to(dtype=pipe.torch_dtype, device=pipe.device)], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0]
-        y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
-        y = torch.concat([msk, y])
-        y = y.unsqueeze(0)
+        vae_inputs, msks = [], []
+        for img, end_img in zip(images, end_images):
+            image = pipe.preprocess_image(img.resize((width, height))).to(pipe.device)
+            msk = torch.ones(1, num_frames, latent_h, latent_w, device=pipe.device)
+            msk[:, 1:] = 0
+            if end_img is not None:
+                end_image_t = pipe.preprocess_image(end_img.resize((width, height))).to(pipe.device)
+                vae_input = torch.concat(
+                    [image.transpose(0, 1), torch.zeros(3, num_frames - 2, height, width).to(image.device), end_image_t.transpose(0, 1)],
+                    dim=1,
+                )
+                msk[:, -1:] = 1
+            else:
+                vae_input = torch.concat(
+                    [image.transpose(0, 1), torch.zeros(3, num_frames - 1, height, width).to(image.device)], dim=1
+                )
+            msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+            msk = msk.view(1, msk.shape[1] // 4, 4, latent_h, latent_w)
+            msk = msk.transpose(1, 2)[0]
+            vae_inputs.append(vae_input.to(dtype=pipe.torch_dtype, device=pipe.device))
+            msks.append(msk)
+
+        y_latents = pipe.vae.encode(vae_inputs, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        y_latents = y_latents.to(dtype=pipe.torch_dtype, device=pipe.device)
+        y = torch.stack([torch.concat([msk, y_latent]) for msk, y_latent in zip(msks, y_latents)], dim=0)
         y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
         return {"y": y}
 
@@ -549,19 +601,23 @@ class WanVideoUnit_FunControl(PipelineUnit):
         if control_video is None:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        control_video = pipe.preprocess_video(control_video)
+        control_video = batch_preprocess_video(pipe, control_video)
         control_latents = pipe.vae.encode(control_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
         control_latents = control_latents.to(dtype=pipe.torch_dtype, device=pipe.device)
         y_dim = pipe.dit.in_dim-control_latents.shape[1]-latents.shape[1]
+        # Batch size read off control_latents (already correctly batched by
+        # batch_preprocess_video above, B=1 for the pre-existing single-clip convention) rather than
+        # hardcoded to 1 -- see ego-moma's batch_size>1 training-support plan.
+        batch_size = control_latents.shape[0]
         # clip_feature and y are independent conditioning signals (CLIP-image embedding vs.
         # VAE-image latent) -- a model with require_clip_embedding=False legitimately has
         # clip_feature=None while still carrying a real y from WanVideoUnit_ImageEmbedderVAE, so
         # each needs its own None-fallback rather than a shared "or" that clobbers a valid y with
         # an all-zero placeholder whenever clip_feature happens to be absent.
         if clip_feature is None:
-            clip_feature = torch.zeros((1, 257, 1280), dtype=pipe.torch_dtype, device=pipe.device)
+            clip_feature = torch.zeros((batch_size, 257, 1280), dtype=pipe.torch_dtype, device=pipe.device)
         if y is None:
-            y = torch.zeros((1, y_dim, (num_frames - 1) // 4 + 1, height // pipe.vae.upsampling_factor, width // pipe.vae.upsampling_factor), dtype=pipe.torch_dtype, device=pipe.device)
+            y = torch.zeros((batch_size, y_dim, (num_frames - 1) // 4 + 1, height // pipe.vae.upsampling_factor, width // pipe.vae.upsampling_factor), dtype=pipe.torch_dtype, device=pipe.device)
         else:
             y = y[:, -y_dim:]
         y = torch.concat([control_latents, y], dim=1)
@@ -581,13 +637,18 @@ class WanVideoUnit_FunReference(PipelineUnit):
         if reference_image is None:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        reference_image = reference_image.resize((width, height))
-        reference_latents = pipe.preprocess_video([reference_image])
+        # `reference_image`: either a single PIL.Image (old convention) or a list of B PIL.Image
+        # (ego-moma's batch_size>1 training-support extension) -- see
+        # batch_preprocess_image_as_video's docstring.
+        is_batched = isinstance(reference_image, list)
+        images = reference_image if is_batched else [reference_image]
+        images = [image.resize((width, height)) for image in images]
+        reference_latents = batch_preprocess_image_as_video(pipe, images if is_batched else images[0])
         reference_latents = pipe.vae.encode(reference_latents, device=pipe.device)
         if pipe.image_encoder is None:
             return {"reference_latents": reference_latents}
-        clip_feature = pipe.preprocess_image(reference_image)
-        clip_feature = pipe.image_encoder.encode_image([clip_feature])
+        clip_features = [pipe.preprocess_image(image) for image in images]
+        clip_feature = torch.cat([pipe.image_encoder.encode_image([f]) for f in clip_features], dim=0)
         return {"reference_latents": reference_latents, "clip_feature": clip_feature}
 
 
@@ -620,7 +681,7 @@ class WanVideoUnit_ConditionVideoAdapter(PipelineUnit):
         if condition_video is None or pipe.dit.condition_video_adapter is None:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        condition_video = pipe.preprocess_video(condition_video)
+        condition_video = batch_preprocess_video(pipe, condition_video)
         condition_video_latents = pipe.vae.encode(
             condition_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride
         ).to(dtype=pipe.torch_dtype, device=pipe.device)

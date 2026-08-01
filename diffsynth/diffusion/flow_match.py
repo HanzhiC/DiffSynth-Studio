@@ -345,20 +345,42 @@ class FlowMatchScheduler():
         return model_output
     
     def add_noise(self, original_samples, noise, timestep):
+        # `timestep.numel() == 1` (the previous, only supported shape): single scalar sigma,
+        # unchanged flattened argmin -- byte-identical to every existing (batch_size=1) caller.
+        # `timestep.numel() > 1`: one independent timestep per batch element (ego-moma's
+        # batch_size>1 training support for VideoGenModel/FlowMatchSFTLoss) -- vectorized per-row
+        # lookup instead of a single global argmin (which would otherwise silently collapse a whole
+        # batch of distinct timesteps down to one shared scalar sigma, or shape-error if
+        # timestep.numel() != len(self.timesteps)). `sigma` is reshaped to broadcast against
+        # `original_samples` of ANY rank (this scheduler is shared across image [B,C,H,W] and video
+        # [B,C,T,H,W] models).
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
-        timestep_id = torch.argmin((self.timesteps - timestep).abs())
-        sigma = self.sigmas[timestep_id]
+        if isinstance(timestep, torch.Tensor) and timestep.numel() > 1:
+            timesteps = self.timesteps.to(timestep.dtype)
+            timestep_id = torch.argmin((timesteps[None, :] - timestep[:, None]).abs(), dim=1)
+            sigma = self.sigmas[timestep_id]
+            sigma = sigma.view(-1, *([1] * (original_samples.dim() - 1))).to(original_samples.device)
+        else:
+            timestep_id = torch.argmin((self.timesteps - timestep).abs())
+            sigma = self.sigmas[timestep_id]
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample
-    
+
     def training_target(self, sample, noise, timestep):
         target = noise - sample
         return target
-    
+
     def training_weight(self, timestep):
-        timestep_id = torch.argmin((self.timesteps - timestep.to(self.timesteps.device)).abs())
-        weights = self.linear_timesteps_weights[timestep_id]
+        # See add_noise's identical batch-vs-scalar split above.
+        timestep = timestep.to(self.timesteps.device)
+        if timestep.numel() > 1:
+            timesteps = self.timesteps.to(timestep.dtype)
+            timestep_id = torch.argmin((timesteps[None, :] - timestep[:, None]).abs(), dim=1)
+            weights = self.linear_timesteps_weights[timestep_id]
+        else:
+            timestep_id = torch.argmin((self.timesteps - timestep).abs())
+            weights = self.linear_timesteps_weights[timestep_id]
         return weights
 
 
