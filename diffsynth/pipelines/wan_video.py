@@ -61,17 +61,8 @@ class WanVideoPipeline(BasePipeline):
             WanVideoUnit_ImageEmbedderVAE(),
             WanVideoUnit_ImageEmbedderCLIP(),
             WanVideoUnit_ImageEmbedderFused(),
-            # FunReference BEFORE FunControl (swapped from upstream's original order) -- ego-moma's
-            # WanVideoUnit_EpisodeControlVideoResampler (below) needs FunReference's own
-            # reference_latents output already computed by the time it runs, and FunControl needs
-            # to run AFTER that resampler so it can consume its control_latents_override. Verified
-            # safe to reorder: the only key both FunControl/FunReference touch is clip_feature, and
-            # FunControl's own handling of it is pass-through-if-already-set/zero-fallback-if-not --
-            # identical final value either way, regardless of which of the two runs first.
-            WanVideoUnit_FunReference(),
-            WanVideoUnit_EpisodeControlVideoResampler(),
             WanVideoUnit_FunControl(),
-            WanVideoUnit_ConditionVideoAdapter(),
+            WanVideoUnit_FunReference(),
             WanVideoUnit_FunCameraControl(),
             WanVideoUnit_SpeedControl(),
             WanVideoUnit_VACE(),
@@ -218,9 +209,6 @@ class WanVideoPipeline(BasePipeline):
         # ControlNet
         control_video: list[Image.Image] = None,
         reference_image: Image.Image = None,
-        # Variable-length condition video (see WanVideoUnit_ConditionVideoAdapter) -- unlike
-        # control_video, this does not need to share num_frames with the target video.
-        condition_video: list[Image.Image] = None,
         # Camera control
         camera_control_direction: Literal["Left", "Right", "Up", "Down", "LeftUp", "LeftDown", "RightUp", "RightDown"] = None,
         camera_control_speed: float = 1/54,
@@ -298,7 +286,6 @@ class WanVideoPipeline(BasePipeline):
             "end_image": end_image,
             "input_video": input_video, "denoising_strength": denoising_strength,
             "control_video": control_video, "reference_image": reference_image,
-            "condition_video": condition_video,
             "camera_control_direction": camera_control_direction, "camera_control_speed": camera_control_speed, "camera_control_origin": camera_control_origin,
             "vace_video": vace_video, "vace_video_mask": vace_video_mask, "vace_reference_image": vace_reference_image, "vace_scale": vace_scale,
             "seed": seed, "rand_device": rand_device,
@@ -413,8 +400,8 @@ def batch_preprocess_video(pipe: "WanVideoPipeline", video, **kwargs):
     real `[B, C, T, H, W]` tensor either way -- `B=1` for the old convention, byte-identical to
     calling `pipe.preprocess_video` directly (this is just that call, unchanged, when `video` isn't
     batched). Every clip in a batch must share `T`/`H`/`W` (guaranteed by ego-moma's
-    `RobotVideoClipDataset`'s fixed per-config `clip_length`/`resize_hw`/`condition_num_frames` --
-    not a constraint this vendored pipeline enforces itself), so a plain `torch.cat` along the batch
+    `RobotVideoClipDataset`'s fixed per-config `clip_length`/`resize_hw` -- not a constraint this
+    vendored pipeline enforces itself), so a plain `torch.cat` along the batch
     dim is enough, no padding.
     """
     if isinstance(video[0], list):
@@ -618,27 +605,18 @@ class WanVideoUnit_ImageEmbedderFused(PipelineUnit):
 class WanVideoUnit_FunControl(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("control_video", "control_latents_override", "num_frames", "height", "width", "tiled", "tile_size", "tile_stride", "clip_feature", "y", "latents"),
+            input_params=("control_video", "num_frames", "height", "width", "tiled", "tile_size", "tile_stride", "clip_feature", "y", "latents"),
             output_params=("clip_feature", "y"),
             onload_model_names=("vae",)
         )
 
-    def process(self, pipe: WanVideoPipeline, control_video, control_latents_override, num_frames, height, width, tiled, tile_size, tile_stride, clip_feature, y, latents):
-        # control_latents_override: ego-moma's WanVideoUnit_EpisodeControlVideoResampler's output,
-        # already VAE-latent-shaped and already resampled to the target clip's own frame count --
-        # skips this unit's own control_video encode entirely when present (the resampler is what
-        # ran instead, precisely because control_video's raw frame count didn't already match the
-        # target's). control_video stays None in that case (see VideoGenModel.get_pipeline_inputs),
-        # so the plain "both absent" no-op below still applies when neither conditioning is used.
-        if control_video is None and control_latents_override is None:
+    def process(self, pipe: WanVideoPipeline, control_video, num_frames, height, width, tiled, tile_size, tile_stride, clip_feature, y, latents):
+        if control_video is None:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        if control_latents_override is not None:
-            control_latents = control_latents_override.to(dtype=pipe.torch_dtype, device=pipe.device)
-        else:
-            control_video = batch_preprocess_video(pipe, control_video)
-            control_latents = pipe.vae.encode(control_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
-            control_latents = control_latents.to(dtype=pipe.torch_dtype, device=pipe.device)
+        control_video = batch_preprocess_video(pipe, control_video)
+        control_latents = pipe.vae.encode(control_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
+        control_latents = control_latents.to(dtype=pipe.torch_dtype, device=pipe.device)
         y_dim = pipe.dit.in_dim-control_latents.shape[1]-latents.shape[1]
         # Batch size read off control_latents (already correctly batched by
         # batch_preprocess_video above, B=1 for the pre-existing single-clip convention) rather than
@@ -685,89 +663,6 @@ class WanVideoUnit_FunReference(PipelineUnit):
         clip_features = [pipe.preprocess_image(image) for image in images]
         clip_feature = torch.cat([pipe.image_encoder.encode_image([f]) for f in clip_features], dim=0)
         return {"reference_latents": reference_latents, "clip_feature": clip_feature}
-
-
-
-class WanVideoUnit_EpisodeControlVideoResampler(PipelineUnit):
-    """Lets `WanVideoUnit_FunControl`'s `control_video` pathway accept a condition (episode) video
-    whose frame count differs from the target clip's own -- see `EpisodeControlVideoResampler`
-    (`wan_video_dit.py`) for the actual resampling mechanism. Runs AFTER `WanVideoUnit_FunReference`
-    in `WanVideoPipeline.__init__`'s `self.units` (needs its `reference_latents` output) and BEFORE
-    `WanVideoUnit_FunControl` (feeds it `control_latents_override`).
-
-    A no-op whenever `condition_video` is None or `pipe.dit.episode_control_video_resampler` isn't
-    attached -- same "trigger on input presence, not loaded-model presence" convention as
-    `WanVideoUnit_ConditionVideoAdapter`. Deliberately does NOT itself decide whether resampling is
-    needed at all (e.g. by comparing frame counts) -- ego-moma's `VideoGenModel.get_pipeline_inputs`
-    makes that call once, upstream: when the episode video's frame count already matches the target
-    clip's, it sets `control_video` directly (this unit's `condition_video` input stays unset,
-    so this unit no-ops and `WanVideoUnit_FunControl`'s own direct-encode path runs unchanged);
-    only when they differ does it set `condition_video` (this unit's trigger) and leave
-    `control_video` unset.
-    """
-
-    def __init__(self):
-        super().__init__(
-            input_params=("condition_video", "reference_latents", "num_frames", "tiled", "tile_size", "tile_stride"),
-            output_params=("control_latents_override",),
-            onload_model_names=("vae",)
-        )
-
-    def process(self, pipe: WanVideoPipeline, condition_video, reference_latents, num_frames, tiled, tile_size, tile_stride):
-        if condition_video is None or pipe.dit.episode_control_video_resampler is None:
-            return {}
-        assert reference_latents is not None, (
-            "WanVideoUnit_EpisodeControlVideoResampler requires reference_latents (i.e. "
-            "reference_image must also be set) -- the resampler's query is jointly derived from "
-            "the target clip's own reference frame and the condition video, see its docstring."
-        )
-        pipe.load_models_to_device(self.onload_model_names)
-        condition_video = batch_preprocess_video(pipe, condition_video)
-        condition_latents = pipe.vae.encode(
-            condition_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride
-        ).to(dtype=pipe.torch_dtype, device=pipe.device)
-        num_target_frames = (num_frames - 1) // 4 + 1
-        control_latents_override = pipe.dit.episode_control_video_resampler(
-            condition_latents, reference_latents.to(dtype=pipe.torch_dtype, device=pipe.device), num_target_frames
-        )
-        return {"control_latents_override": control_latents_override}
-
-
-
-class WanVideoUnit_ConditionVideoAdapter(PipelineUnit):
-    """Feeds a variable-length condition video (e.g. a downsampled full robot episode, see
-    ego-moma's `src/datasets/robot_video_gen_dataset.py`) into `WanModel`'s optional pooled
-    cross-attention channel (see `wan_video_dit.py::ConditionVideoAdapter`/
-    `WanModel.add_condition_video_adapter`). Unlike `WanVideoUnit_FunControl`'s `control_video`
-    (channel-concatenated with the noised latent, so it must already share the target's frame
-    count), this pools the condition video into a small, fixed token count first, decoupling its
-    length from both the target video's length and from itself run to run.
-
-    A no-op unless BOTH `condition_video` is passed AND the loaded `pipe.dit` actually has the
-    adapter attached (`pipe.dit.condition_video_adapter is not None`) -- this generalizes this
-    codebase's usual "trigger on input presence, not loaded-model presence" `PipelineUnit`
-    convention: the adapter module itself isn't part of any pretrained checkpoint, so its absence
-    is the normal case for every Wan config except the one that explicitly calls
-    `add_condition_video_adapter()`.
-    """
-
-    def __init__(self):
-        super().__init__(
-            input_params=("condition_video", "tiled", "tile_size", "tile_stride"),
-            output_params=("condition_video_tokens",),
-            onload_model_names=("vae",)
-        )
-
-    def process(self, pipe: WanVideoPipeline, condition_video, tiled, tile_size, tile_stride):
-        if condition_video is None or pipe.dit.condition_video_adapter is None:
-            return {}
-        pipe.load_models_to_device(self.onload_model_names)
-        condition_video = batch_preprocess_video(pipe, condition_video)
-        condition_video_latents = pipe.vae.encode(
-            condition_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride
-        ).to(dtype=pipe.torch_dtype, device=pipe.device)
-        condition_video_tokens = pipe.dit.condition_video_adapter(condition_video_latents)
-        return {"condition_video_tokens": condition_video_tokens}
 
 
 
@@ -1475,7 +1370,6 @@ def model_fn_wan_video(
     context: torch.Tensor = None,
     clip_feature: Optional[torch.Tensor] = None,
     y: Optional[torch.Tensor] = None,
-    condition_video_tokens: Optional[torch.Tensor] = None,
     reference_latents = None,
     vace_context = None,
     vace_scale = 1.0,
@@ -1820,7 +1714,7 @@ def model_fn_wan_video(
                     block,
                     use_gradient_checkpointing,
                     use_gradient_checkpointing_offload,
-                    x, context, t_mod, freqs, condition_video_tokens,
+                    x, context, t_mod, freqs,
                 )
 
 
