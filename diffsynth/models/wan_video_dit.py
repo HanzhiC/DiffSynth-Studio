@@ -304,6 +304,128 @@ class ConditionVideoAdapter(nn.Module):
         return out
 
 
+class EpisodeControlVideoResampler(nn.Module):
+    """Resamples a variable-length condition (episode demo) video's `F_cond` VAE-latent frames down
+    to exactly `F_target` frames (the target clip's own latent frame count), so the result can
+    channel-concat through `WanVideoUnit_FunControl`'s pretrained `control_video` pathway even when
+    the raw episode video and the target clip don't share a frame count -- an alternative to forcing
+    `DATA.condition_num_frames == DATA.clip_length` at the dataset level (see ego-moma's
+    `VideoGenModel.control_video_from_episode` docstring: when the two already match, this module
+    is skipped entirely and the existing direct-encode path is used unchanged).
+
+    Mechanism: each of the `F_target` output frames is produced by a cross-attention-weighted blend
+    of the condition video's OWN `F_cond` latent frames (full spatial content preserved -- the
+    attention weights are computed from small pooled per-frame descriptors, but then applied to the
+    full-resolution latents themselves, not to the descriptors), where the query for output frame
+    `i` is `target_pos_emb[i] + proj(reference_descriptor)` -- i.e. BOTH a learned per-target-slot
+    position and the episode's own reference (current/start) frame jointly decide which parts of
+    the demo are relevant for that output slot. `reference_latent` is `WanVideoUnit_FunReference`'s
+    own output (reused directly, no extra VAE encode needed for it).
+
+    Gated via a plain per-target-frame-slot scalar (`self.gate`, shape `[max_target_frames]`, NOT a
+    dynamic per-token function this time): `output = reference_latent + gate * (blended -
+    reference_latent)`, a convex combination when `gate` in `[0, 1]` (not hard-constrained to that
+    range, but that is the intended operating regime). `gate_init` sets its initial value directly
+    (no sigmoid reparameterization -- a plain, directly-readable-and-settable parameter, matching
+    ConditionVideoCrossAttention's own history: a single global dynamic-per-token gate turned out to
+    be hard to monitor meaningfully on its own; this module's gate has only `max_target_frames`
+    (~10) values total, small enough to track directly without needing a realized-forward-value
+    trick). At `gate=0` (any target frame slot), that slot's output is EXACTLY `reference_latent` --
+    i.e. at `gate_init=0` construction reduces to "control_video = reference frame repeated",
+    itself a real, in-distribution, non-degenerate starting point (not noise) for the pretrained,
+    ungated `patch_embedding` this feeds into -- deliberately safer than feeding that pathway a
+    freshly-initialized module's raw output the way `ConditionVideoCrossAttention` now does for its
+    OWN (residual-additive, not channel-concat) branch.
+
+    Not part of any pretrained Wan checkpoint's state dict -- attached post-hoc via
+    `WanModel.add_episode_control_video_resampler`, same convention as `add_condition_video_adapter`.
+
+    **Kept in float32, deliberately NOT cast to the backbone's bf16** (see
+    `add_episode_control_video_resampler`): this whole model trains natively in bf16 with no FP32
+    master-weight copy, and AdamW's per-step update magnitude is roughly `lr` (~1e-4) regardless of
+    a parameter's own gradient scale (that's the point of Adam's normalization) -- for a parameter
+    sitting at a value where bf16's absolute precision (~value/128) exceeds that update size, the
+    update silently rounds to exactly zero every step, forever, no matter how large or consistent
+    the true gradient is. Confirmed empirically: on a real training run, `self.gate` (value ~0.05,
+    bf16 ULP there ~0.0004) had the LARGEST gradient of every parameter in this module
+    (grad_abs_mean ~2.5e-4, ~100x every other parameter's) yet never moved a single bit across 3000
+    steps, while `k.bias` (value near 0, where bf16 has fine absolute precision) moved substantially
+    despite a ~1000x SMALLER gradient -- ruling out "vanishing gradient" and pointing squarely at
+    this update-rounds-to-zero mechanism (also visibly affected `norm_query`/`norm_key.weight`,
+    both initialized to 1.0). `forward` upcasts its bf16 inputs to float32 internally and downcasts
+    the output back at the very end, so this module's own optimizer step always happens in full
+    precision regardless of what dtype the rest of the pipeline runs in.
+    """
+
+    def __init__(self, in_channels, attn_dim=256, num_heads=8, patch_size=(1, 2, 2),
+                 max_target_frames=128, max_condition_frames=256, gate_init=0.0):
+        super().__init__()
+        self.in_channels = in_channels
+        self.attn_dim = attn_dim
+        self.num_heads = num_heads
+        self.max_target_frames = max_target_frames
+        self.max_condition_frames = max_condition_frames
+        # Per-frame descriptor extractor -- coarse, spatially-pooled (mean over H,W after the patch
+        # conv), used ONLY to decide attention weights, not to reconstruct output content. Shared
+        # between condition frames and the reference frame (same conv, same channel count).
+        self.frame_descriptor = nn.Conv3d(in_channels, attn_dim, kernel_size=patch_size, stride=patch_size)
+        self.target_pos_emb = nn.Parameter(torch.randn(1, max_target_frames, attn_dim) * 0.02)
+        self.reference_proj = nn.Linear(attn_dim, attn_dim)
+        self.norm_query = nn.LayerNorm(attn_dim)
+        self.norm_key = nn.LayerNorm(attn_dim)
+        self.q = nn.Linear(attn_dim, attn_dim)
+        self.k = nn.Linear(attn_dim, attn_dim)
+        # Plain per-target-frame-slot scalar gate -- see class docstring. NOT sigmoid-reparameterized
+        # (unlike ConditionVideoCrossAttention's earlier per-token design): directly settable/
+        # readable, small enough (max_target_frames values) to track meaningfully as-is.
+        self.gate = nn.Parameter(torch.full((max_target_frames,), float(gate_init)))
+
+    def _frame_descriptors(self, latents):
+        """latents: [B, C, F, H, W] -> [B, F, attn_dim] (mean-pooled over the patch grid)."""
+        x = self.frame_descriptor(latents)  # [B, attn_dim, F, H', W']
+        return x.mean(dim=(3, 4)).transpose(1, 2)  # [B, F, attn_dim]
+
+    def forward(self, condition_latents, reference_latent, num_target_frames):
+        """`condition_latents`: [B, C, F_cond, H, W]. `reference_latent`: [B, C, 1, H, W] (
+        `WanVideoUnit_FunReference`'s own output). `num_target_frames`: the target clip's own
+        latent frame count (`F_target`) -- this module has no other way to know it, since
+        `condition_latents`/`reference_latent` alone don't carry that information. Returns
+        `[B, C, num_target_frames, H, W]`, cast back to the INPUT dtype (see class docstring for
+        why this module's own parameters/computation stay in float32 regardless)."""
+        output_dtype = condition_latents.dtype
+        condition_latents = condition_latents.float()
+        reference_latent = reference_latent.float()
+        b, c, f_cond, h, w = condition_latents.shape
+        if f_cond > self.max_condition_frames:
+            raise ValueError(
+                f"condition video has {f_cond} VAE-latent frames, exceeding max_condition_frames="
+                f"{self.max_condition_frames} this resampler was constructed with."
+            )
+        if num_target_frames > self.max_target_frames:
+            raise ValueError(
+                f"target clip has {num_target_frames} VAE-latent frames, exceeding "
+                f"max_target_frames={self.max_target_frames} this resampler was constructed with."
+            )
+        condition_desc = self._frame_descriptors(condition_latents)  # [B, F_cond, attn_dim]
+        reference_desc = self._frame_descriptors(reference_latent).squeeze(1)  # [B, attn_dim]
+
+        queries = self.target_pos_emb[:, :num_target_frames, :] + self.reference_proj(reference_desc).unsqueeze(1)
+        queries = self.norm_query(queries)  # [B, F_target, attn_dim]
+        keys = self.norm_key(condition_desc)  # [B, F_cond, attn_dim]
+
+        head_dim = self.attn_dim // self.num_heads
+        q = rearrange(self.q(queries), "b t (n d) -> b n t d", n=self.num_heads)
+        k = rearrange(self.k(keys), "b s (n d) -> b n s d", n=self.num_heads)
+        attn_weights = torch.softmax(q @ k.transpose(-1, -2) / (head_dim ** 0.5), dim=-1)
+        attn_weights = attn_weights.mean(dim=1)  # [B, F_target, F_cond] -- already float32 throughout
+
+        blended = torch.einsum("bts,bcshw->bcthw", attn_weights, condition_latents)  # [B, C, F_target, H, W]
+        reference_expanded = reference_latent.expand(b, c, num_target_frames, h, w)
+        gate = self.gate[:num_target_frames].view(1, 1, num_target_frames, 1, 1)
+        output = reference_expanded + gate * (blended - reference_expanded)
+        return output.to(output_dtype)
+
+
 class ConditionVideoCrossAttention(nn.Module):
     """A new, separate cross-attention branch for injecting `ConditionVideoAdapter`'s pooled
     tokens into a `DiTBlock` -- deliberately NOT the same code path as `CrossAttention`'s existing
@@ -617,6 +739,9 @@ class WanModel(torch.nn.Module):
         # ConditionVideoAdapter's docstring for why this isn't wired through model_configs.py).
         self.has_condition_video_input = False
         self.condition_video_adapter = None
+        # Set by add_episode_control_video_resampler (post-hoc opt-in -- see
+        # EpisodeControlVideoResampler's docstring).
+        self.episode_control_video_resampler = None
 
         self.prepare_wantodance(in_dim, dim, num_heads, has_image_pos_emb, out_dim, patch_size, eps,
                                 wantodance_enable_music_inject, wantodance_music_inject_layers, wantodance_enable_refimage, wantodance_enable_refface,
@@ -742,6 +867,38 @@ class WanModel(torch.nn.Module):
                 device=ref_param.device, dtype=ref_param.dtype
             )
         self.has_condition_video_input = True
+
+    def add_episode_control_video_resampler(self, in_channels=48, attn_dim=256, num_heads=8,
+                                              max_target_frames=128, max_condition_frames=256, gate_init=0.0):
+        """Post-hoc opt-in (see EpisodeControlVideoResampler's own docstring for the full
+        rationale): attaches a resampler that lets `WanVideoUnit_FunControl`'s `control_video`
+        channel-concat pathway accept a condition (episode) video whose frame count DIFFERS from
+        the target clip's own -- resampled down to match via a reference-frame-informed
+        cross-attention blend, rather than requiring `DATA.condition_num_frames ==
+        DATA.clip_length` (ego-moma's `control_video_from_episode` docstring covers the
+        equal-length case, which skips this resampler entirely).
+
+        `in_channels=48` matches the Wan2.2 VAE's latent channel count, same as
+        `add_condition_video_adapter`. `attn_dim` is this module's OWN internal attention
+        dimension for computing blend weights (deliberately much smaller than `self.dim`, since it
+        only needs to represent "which condition frame is relevant," not reconstruct content --
+        the actual blended output stays in the original `in_channels`-channel VAE-latent space).
+        `max_target_frames`/`max_condition_frames` size, respectively, the learned per-target-slot
+        embedding table and a soft cap on how long a condition video this resampler tolerates
+        (raises if exceeded at call time) -- pass values with headroom over any config's actual
+        `clip_length`/`condition_num_frames`, same convention as `add_condition_video_adapter`'s
+        `max_latent_frames`.
+
+        Deliberately NOT cast to `ref_param.dtype` (bf16) -- see EpisodeControlVideoResampler's own
+        docstring: this module's parameters stay float32 so its optimizer updates don't silently
+        round to zero at bf16 precision; only the device is matched here.
+        """
+        ref_param = self.patch_embedding.weight
+        self.episode_control_video_resampler = EpisodeControlVideoResampler(
+            in_channels=in_channels, attn_dim=attn_dim, num_heads=num_heads,
+            max_target_frames=max_target_frames, max_condition_frames=max_condition_frames,
+            gate_init=gate_init,
+        ).to(device=ref_param.device)
 
     def enable_condition_attention_capture(self):
         """Turn on attention-weight recording for both the condition-video pooling step
