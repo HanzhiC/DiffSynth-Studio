@@ -311,12 +311,29 @@ class ConditionVideoCrossAttention(nn.Module):
     projection `self.o` and was trained end-to-end by the original authors, so it isn't zero-init
     and isn't a template reusable for a module we're adding fresh post-hoc.
 
-    Zero-init via a learnable scalar gate (Flamingo-style "gated cross-attention"), not via
-    zero-initializing `self.o` itself: `self.o` keeps normal initialization so it has something
-    real to learn from step one once `gate` moves away from 0, while `gate=0` at construction time
-    makes this branch's contribution to `DiTBlock.forward` exactly zero -- i.e. a freshly-attached
-    instance is an exact identity, and training starts from the pretrained checkpoint's unmodified
-    behavior (the actual ControlNet-style guarantee this design depends on)."""
+    NO gate at all -- deliberately removed (this class went through two gated designs first: a
+    single global scalar per block, then a dynamic per-token `sigmoid(gate_proj(x))`; see git
+    history). Both were empirically observed, on real training runs of this exact module, to
+    suppress the branch rather than learn to use it: the scalar gate never moved off its zero-init
+    after 17k steps (pure noise, no directional signal); the dynamic per-token gate DID receive a
+    real, directional gradient (gate_proj.weight's norm grew steadily) but used it to learn to
+    shrink the realized gate toward 0 for real inputs (from ~0.027 at init down to ~0.00014 by step
+    1100, monotonically, no sign of self-correcting) -- i.e. the model was actively learning to
+    turn this branch OFF, not gradually learn to use it. Rather than keep chasing a gating scheme
+    that the optimizer keeps using against us, this now matches arXiv:2512.02015 (Edit-by-Track)'s
+    own injection for its (different, track-based) conditioning signal: a plain, ungated
+    element-wise addition (`τ` added directly to the video tokens, no learned gate) -- forcing the
+    branch to matter from step 1 rather than giving the optimizer an easy escape hatch to ignore
+    it. This is a real, deliberate tradeoff, not a free improvement: `q`/`k`/`v`/`o` are still
+    randomly initialized (nothing here is part of any pretrained checkpoint), so this branch now
+    injects a genuinely random signal at FULL strength into every block's residual stream from
+    step 1 -- unlike the gated designs, there is no "close to unperturbed at step 0" guarantee
+    anymore, and the pretrained backbone's own quality at the very start of training may visibly
+    degrade until this branch's weights converge to something useful. `last_branch_norm`/
+    `last_input_norm` (populated every forward call, see below) are this class's replacement for
+    the old gate-value monitoring (`ego-moma`'s `video_gen_algo.py::_log_condition_gate_stats`) --
+    with no explicit gate to read, "how much is this branch actually contributing" is measured
+    directly as this branch's output norm relative to the residual stream's own norm instead."""
 
     def __init__(self, dim, num_heads, eps=1e-6):
         super().__init__()
@@ -328,7 +345,6 @@ class ConditionVideoCrossAttention(nn.Module):
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
         self.o = nn.Linear(dim, dim)
-        self.gate = nn.Parameter(torch.zeros(1))
         self.attn = AttentionModule(num_heads)
 
         # Attention-capture instrumentation (off by default -- see
@@ -369,7 +385,17 @@ class ConditionVideoCrossAttention(nn.Module):
             out = self._attend_with_capture(q, k, v)
         else:
             out = self.attn(q, k, v)
-        return self.gate * self.o(out)
+        branch_out = self.o(out)
+        # Cheap running stats (mean per-token L2 norm this forward call) for training-time
+        # monitoring (see ego-moma's video_gen_algo.py::_log_condition_gate_stats) -- with no
+        # explicit gate anymore, this is the closest available substitute for "how much is this
+        # branch actually contributing right now": branch_out's own norm relative to x's (the
+        # residual stream it's being added into). Needs no unfused-attention fallback/
+        # capture_attention flag, unlike captured_attn_history -- always populated during ordinary
+        # training.
+        self.last_branch_norm = branch_out.detach().float().norm(dim=-1).mean()
+        self.last_input_norm = x.detach().float().norm(dim=-1).mean()
+        return branch_out
 
 
 class DiTBlock(nn.Module):
@@ -685,10 +711,11 @@ class WanModel(torch.nn.Module):
     def add_condition_video_adapter(self, in_channels=48, tokens_per_frame=8, num_heads=8, max_latent_frames=128):
         """Post-hoc opt-in (see ConditionVideoAdapter/ConditionVideoCrossAttention's docstrings for
         the full rationale): attaches a fresh ConditionVideoAdapter pooler to this model plus a new,
-        separately gated cross-attention branch to every DiTBlock. Called by the training wrapper
-        (see ego-moma's src/models/vla/video_gen.py) after loading pretrained weights via
-        from_pretrained -- not part of any pretrained checkpoint's state dict, so not resolved
-        through configs/model_configs.py's hash-based registry.
+        UNGATED cross-attention branch to every DiTBlock (see ConditionVideoCrossAttention's own
+        docstring for why the gate was removed). Called by the training wrapper (see ego-moma's
+        src/models/vla/video_gen.py) after loading pretrained weights via from_pretrained -- not
+        part of any pretrained checkpoint's state dict, so not resolved through
+        configs/model_configs.py's hash-based registry.
 
         `in_channels=48` matches the Wan2.2 VAE's latent channel count (WanVideoVAE38) used by both
         wan2.2_ti2v_5b and wan2.2_fun_5b_control -- the only backbones this has been used with so

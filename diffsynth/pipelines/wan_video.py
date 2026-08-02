@@ -582,9 +582,27 @@ class WanVideoUnit_ImageEmbedderFused(PipelineUnit):
         if input_image is None or not pipe.dit.fuse_vae_embedding_in_latents:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        image = pipe.preprocess_image(input_image.resize((width, height))).transpose(0, 1)
-        z = pipe.vae.encode([image], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
-        latents[:, :, 0: 1] = z
+        # `input_image`: either a single PIL.Image (old convention, B=1) or a list of B PIL.Image
+        # (ego-moma's batch_size>1 training-support extension) -- same convention as
+        # batch_preprocess_image_as_video, applied here inline since this unit's own vae_input
+        # construction (per-image resize) isn't a plain preprocess_video call.
+        images = input_image if isinstance(input_image, list) else [input_image]
+        vae_inputs = [
+            pipe.preprocess_image(img.resize((width, height))).transpose(0, 1) for img in images
+        ]
+        z = pipe.vae.encode(vae_inputs, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        z = z.to(dtype=pipe.torch_dtype, device=pipe.device)
+        if latents is not None:
+            if latents.shape[0] != z.shape[0]:
+                # `latents` here is WanVideoUnit_InputVideoEmbedder's passthrough of
+                # WanVideoUnit_NoiseInitializer's own `noise` (untouched, still hardcoded to
+                # batch=1 -- unrelated to this fix: VideoGenModel.compute_losses discards this
+                # unit's "latents" output entirely and rebuilds it correctly batched right after
+                # the units loop finishes, only `first_frame_latents` below matters for training).
+                # Expand rather than crash so the mutation below stays well-defined for B>1 too;
+                # a no-op when they already match (e.g. real single-clip generation, B=1).
+                latents = latents.expand(z.shape[0], *latents.shape[1:]).clone()
+            latents[:, :, 0: 1] = z
         return {"latents": latents, "fuse_vae_embedding_in_latents": True, "first_frame_latents": z}
 
 
@@ -1534,11 +1552,27 @@ def model_fn_wan_video(
 
     # Timestep
     if dit.seperated_timestep and fuse_vae_embedding_in_latents:
-        timestep = torch.concat([
-            torch.zeros((1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device),
-            torch.ones((latents.shape[2] - 1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device) * timestep
-        ]).flatten()
-        t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep).unsqueeze(0))
+        # Per-sample batching (ego-moma's batch_size>1 training support): the first (fused) latent
+        # frame always gets timestep 0 (it's a known/clean frame, not something to denoise) and
+        # every other latent frame gets THIS SAMPLE's own timestep -- built per-row instead of a
+        # single shared scalar broadcast, since `timestep` may now be `[B]` (one independently
+        # sampled value per clip in the batch, VideoGenModel.compute_losses's convention) rather
+        # than a single shared value. `sinusoidal_embedding_1d`'s own `torch.outer` only accepts a
+        # 1-D position tensor, so the batch dim is flattened into the sequence dim before that call
+        # and un-flattened after (replacing the old hardcoded `.unsqueeze(0)`, which silently
+        # assumed B=1) -- numerically identical to the old per-sample computation when B=1.
+        batch_size = latents.shape[0]
+        hw4 = latents.shape[3] * latents.shape[4] // 4
+        num_latent_frames = latents.shape[2]
+        per_sample_timestep = timestep.to(latents.dtype).view(batch_size, 1, 1)
+        zeros_frame = torch.zeros((batch_size, 1, hw4), dtype=latents.dtype, device=latents.device)
+        rest_frames = torch.ones(
+            (batch_size, num_latent_frames - 1, hw4), dtype=latents.dtype, device=latents.device
+        ) * per_sample_timestep
+        timestep = torch.cat([zeros_frame, rest_frames], dim=1).flatten(1)  # [B, T*hw4]
+        t = dit.time_embedding(
+            sinusoidal_embedding_1d(dit.freq_dim, timestep.flatten()).reshape(batch_size, -1, dit.freq_dim)
+        )
         if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1:
             t_chunks = torch.chunk(t, get_sequence_parallel_world_size(), dim=1)
             t_chunks = [torch.nn.functional.pad(chunk, (0, 0, 0, t_chunks[0].shape[1]-chunk.shape[1]), value=0) for chunk in t_chunks]
