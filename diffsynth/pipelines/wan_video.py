@@ -209,6 +209,17 @@ class WanVideoPipeline(BasePipeline):
         # ControlNet
         control_video: list[Image.Image] = None,
         reference_image: Image.Image = None,
+        # Generic, backbone-agnostic "extra clean context frames" prefix (ego-moma's
+        # condition_video mechanism, see VideoGenModel.generate_video): a PRECOMPUTED VAE-latent
+        # tensor ([B, C, K, H_lat, W_lat]) prepended to the noisy `latents` sequence right after
+        # WanVideoUnit_ImageEmbedderFused writes the fused first frame, kept clean across every
+        # denoising step (re-asserted alongside first_frame_latents, see the loop below), and
+        # stripped back off before decode. Requires `fuse_vae_embedding_in_latents` (i.e.
+        # `first_frame_latents` present) to also be active -- asserted below. Deliberately generic
+        # (not itself aware of condition_video/any learnable separator -- callers build this
+        # tensor themselves and only hand over the finished result) so this vendored fork stays a
+        # plain, reusable "clean prefix" primitive.
+        clean_prefix_latents: torch.Tensor = None,
         # Camera control
         camera_control_direction: Literal["Left", "Right", "Up", "Down", "LeftUp", "LeftDown", "RightUp", "RightDown"] = None,
         camera_control_speed: float = 1/54,
@@ -286,6 +297,7 @@ class WanVideoPipeline(BasePipeline):
             "end_image": end_image,
             "input_video": input_video, "denoising_strength": denoising_strength,
             "control_video": control_video, "reference_image": reference_image,
+            "clean_prefix_latents": clean_prefix_latents,
             "camera_control_direction": camera_control_direction, "camera_control_speed": camera_control_speed, "camera_control_origin": camera_control_origin,
             "vace_video": vace_video, "vace_video_mask": vace_video_mask, "vace_reference_image": vace_reference_image, "vace_scale": vace_scale,
             "seed": seed, "rand_device": rand_device,
@@ -306,6 +318,24 @@ class WanVideoPipeline(BasePipeline):
         for unit in self.units:
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
 
+        # Clean-prefix extension (ego-moma's condition_video mechanism) -- see clean_prefix_latents'
+        # own parameter docstring above. Pop it out of inputs_shared once consumed here so it isn't
+        # also (harmlessly, but pointlessly) splatted into every model_fn call below via **kwargs.
+        clean_prefix_latents = inputs_shared.pop("clean_prefix_latents", None)
+        num_clean_prefix_frames = 0
+        if clean_prefix_latents is not None:
+            assert "first_frame_latents" in inputs_shared, (
+                "clean_prefix_latents requires fused first-frame conditioning (input_image + "
+                "pipe.dit.fuse_vae_embedding_in_latents) to also be active."
+            )
+            # Concatenation happens AFTER WanVideoUnit_ImageEmbedderFused already wrote
+            # latents[:, :, 0:1] = first_frame_latents (inside the units loop above) -- concat just
+            # shifts that already-correct value from index 0 to index num_clean_prefix_frames, no
+            # separate initial overwrite needed here.
+            inputs_shared["latents"] = torch.concat([clean_prefix_latents, inputs_shared["latents"]], dim=2)
+            num_clean_prefix_frames = clean_prefix_latents.shape[2]
+        total_clean_prefix_frames = num_clean_prefix_frames + (1 if "first_frame_latents" in inputs_shared else 0)
+
         # Denoise
         self.load_models_to_device(self.in_iteration_models)
         models = {name: getattr(self, name) for name in self.in_iteration_models}
@@ -320,12 +350,18 @@ class WanVideoPipeline(BasePipeline):
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
             
             # Inference
-            noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
+            noise_pred_posi = self.model_fn(
+                **models, **inputs_shared, **inputs_posi, timestep=timestep,
+                num_clean_prefix_frames=total_clean_prefix_frames,
+            )
             if cfg_scale != 1.0:
                 if cfg_merge:
                     noise_pred_posi, noise_pred_nega = noise_pred_posi.chunk(2, dim=0)
                 else:
-                    noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep)
+                    noise_pred_nega = self.model_fn(
+                        **models, **inputs_shared, **inputs_nega, timestep=timestep,
+                        num_clean_prefix_frames=total_clean_prefix_frames,
+                    )
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
             else:
                 noise_pred = noise_pred_posi
@@ -333,8 +369,23 @@ class WanVideoPipeline(BasePipeline):
             # Scheduler
             inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
             if "first_frame_latents" in inputs_shared:
-                inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
-        
+                # Re-assert the WHOLE clean prefix (condition-context frames, if any, plus the
+                # fused first frame) every step -- scheduler.step's update is applied uniformly
+                # across the whole latents tensor, with no notion of "this part should stay clean",
+                # so anything not explicitly restored here would slowly accumulate noise over the
+                # sampling loop.
+                if clean_prefix_latents is not None:
+                    inputs_shared["latents"][:, :, :num_clean_prefix_frames] = clean_prefix_latents
+                inputs_shared["latents"][:, :, num_clean_prefix_frames:num_clean_prefix_frames + 1] = (
+                    inputs_shared["first_frame_latents"]
+                )
+
+        # Strip the condition-context prefix (if any) before decode -- unlike first_frame_latents
+        # (kept: the decoded output should literally start with the given first frame, matching
+        # ordinary I2V semantics), condition_video/separator frames were never part of the video
+        # being generated, only invisible context, so they must not appear in the decoded output.
+        if clean_prefix_latents is not None:
+            inputs_shared["latents"] = inputs_shared["latents"][:, :, num_clean_prefix_frames:]
         # VACE (TODO: remove it)
         if vace_reference_image is not None or (animate_pose_video is not None and animate_face_video is not None):
             if vace_reference_image is not None and isinstance(vace_reference_image, list):
@@ -1393,6 +1444,13 @@ def model_fn_wan_video(
     use_gradient_checkpointing_offload: bool = False,
     control_camera_latents_input = None,
     fuse_vae_embedding_in_latents: bool = False,
+    # How many LEADING latent frames of `latents` the seperated_timestep/fuse_vae_embedding_in_latents
+    # branch below should treat as already-clean (timestep 0) rather than noise to denoise -- default
+    # 1 preserves this function's original, single-fused-first-frame behavior byte-for-byte for every
+    # other caller in this vendored file (ego-moma's own extension: prepending extra clean context
+    # frames, e.g. `condition_video`, ahead of the fused first frame -- see
+    # VideoGenModel.compute_losses in ego-moma's src/models/policy/video_generator.py).
+    num_clean_prefix_frames: int = 1,
     wantodance_refimage_feature = None,
     wantodance_fps: float = 30.0,
     music_feature = None,
@@ -1522,9 +1580,9 @@ def model_fn_wan_video(
         hw4 = latents.shape[3] * latents.shape[4] // 4
         num_latent_frames = latents.shape[2]
         per_sample_timestep = timestep.to(latents.dtype).view(batch_size, 1, 1)
-        zeros_frame = torch.zeros((batch_size, 1, hw4), dtype=latents.dtype, device=latents.device)
+        zeros_frame = torch.zeros((batch_size, num_clean_prefix_frames, hw4), dtype=latents.dtype, device=latents.device)
         rest_frames = torch.ones(
-            (batch_size, num_latent_frames - 1, hw4), dtype=latents.dtype, device=latents.device
+            (batch_size, num_latent_frames - num_clean_prefix_frames, hw4), dtype=latents.dtype, device=latents.device
         ) * per_sample_timestep
         timestep = torch.cat([zeros_frame, rest_frames], dim=1).flatten(1)  # [B, T*hw4]
         t = dit.time_embedding(
